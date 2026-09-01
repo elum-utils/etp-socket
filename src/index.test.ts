@@ -5,13 +5,15 @@ const fakeWorkers = vi.hoisted(() => {
     onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
     onerror: (() => void) | null = null;
     readonly messages: unknown[] = [];
+    readonly transfers: Transferable[][] = [];
 
     constructor() {
       instances.push(this);
     }
 
-    postMessage(message: unknown): void {
+    postMessage(message: unknown, transfer: Transferable[] = []): void {
       this.messages.push(message);
+      this.transfers.push(transfer);
     }
 
     deliver(message: unknown): void {
@@ -34,6 +36,10 @@ type Outgoing = {
     request: { text: string };
     response: { id: string };
   };
+  upload: {
+    request: { file: Uint8Array; name: string };
+    response: { ok: boolean };
+  };
 };
 
 type Incoming = {
@@ -50,6 +56,7 @@ describe("public socket API", () => {
     const auth = vi.fn(async () => "token");
     const socket = io<Outgoing, Incoming>({ url: "wss://example.test/ws", auth, autoConnect: false });
     const worker = latestWorker();
+    expect((worker.messages[0] as { config: { protocol: { checksum: boolean } } }).config.protocol.checksum).toBe(false);
 
     socket.connect();
     worker.deliver({ type: "auth", epoch: 4 });
@@ -80,6 +87,26 @@ describe("public socket API", () => {
     worker.deliver({ type: "response", callID: emit.callID, error: { code: "timeout", message: "request timed out" } });
 
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({ code: "timeout" }), undefined);
+  });
+
+  it("prepares byte arrays as multipart binary fields", () => {
+    const socket = io<Outgoing, Incoming>({ url: "wss://example.test/ws", auth: () => "token", autoConnect: false });
+    const worker = latestWorker(), file = new Uint8Array([1, 2, 3]);
+    void socket.emit("upload", { file, name: "bytes.bin" });
+    const emit = worker.messages.at(-1) as { data: { __etpMultipart: boolean; fields: unknown[]; parts: Array<{ field: string; blob: Uint8Array }> } };
+    expect(emit.data.__etpMultipart).toBe(true);
+    expect(emit.data.parts).toEqual([{ field: "file", index: 0, name: "", blob: file }]);
+    expect(emit.data.fields).toEqual([{ key: "name", value: "bytes.bin" }]);
+  });
+
+  it("transfers binary ownership only when explicitly requested", () => {
+    const socket = io<Outgoing, Incoming>({ url: "wss://example.test/ws", auth: () => "token", autoConnect: false });
+    const worker = latestWorker(), copied = new Uint8Array([1, 2]), transferred = new Uint8Array([3, 4]);
+
+    void socket.emit("upload", { file: copied, name: "copied.bin" });
+    expect(worker.transfers.at(-1)).toEqual([]);
+    void socket.emit("upload", { file: transferred, name: "transferred.bin" }, { transfer: true });
+    expect(worker.transfers.at(-1)).toEqual([transferred.buffer]);
   });
 
   it("registers, removes and runs one-shot incoming event listeners", () => {

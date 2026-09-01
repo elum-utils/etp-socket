@@ -3,6 +3,10 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "baseUrl": ".",
+    "paths": {
+      "@elum/etp-socket": ["src/index.ts"]
+    },
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "strict": true,
     "declaration": false,
@@ -10,6 +14,6 @@
     "skipLibCheck": true,
     "noEmit": false
   },
-  "include": ["src/**/*.ts", "config/**/*.ts", "vitest.config.ts"],
+  "include": ["src/**/*.ts", "config/**/*.ts", "examples/browser/**/*.ts", "vitest.config.ts"],
   "exclude": ["dist", "node_modules"]
 }

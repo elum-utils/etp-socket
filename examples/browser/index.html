@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>ETP transport console</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div>
+          <strong>ETP transport console</strong>
+          <span class="endpoint">ws://127.0.0.1:18992/socket</span>
+        </div>
+        <div class="connection">
+          <span id="status-dot" class="status-dot"></span>
+          <span id="status">connecting</span>
+          <button id="connection-button" type="button">Disconnect</button>
+        </div>
+      </header>
+
+      <main>
+        <section class="ping-panel" aria-labelledby="ping-title">
+          <div>
+            <h1 id="ping-title">Request / response</h1>
+            <p class="metric"><span id="latency">--</span><small>ms last latency</small></p>
+          </div>
+          <form id="ping-form">
+            <input id="ping-message" value="ping" aria-label="Message" autocomplete="off" />
+            <button type="submit">Send ping</button>
+          </form>
+          <output id="pong-output">Waiting for response</output>
+        </section>
+
+        <section class="upload-panel" aria-labelledby="upload-title">
+          <div class="section-heading">
+            <div>
+              <h2 id="upload-title">Large file transfer</h2>
+              <p id="queue-summary">No files queued</p>
+            </div>
+            <div class="generate-controls">
+              <select id="generated-size" aria-label="Generated test file size">
+                <option value="8">8 MiB</option>
+                <option value="32" selected>32 MiB</option>
+                <option value="64">64 MiB</option>
+                <option value="128">128 MiB</option>
+              </select>
+              <button id="generate-file" type="button">Generate test file</button>
+            </div>
+          </div>
+
+          <label id="drop-zone" class="drop-zone">
+            <input id="file-input" type="file" multiple />
+            <span>Choose files or drop them here</span>
+            <small>Files are uploaded one by one while ping remains available. Server limits: 10 requests/s, 256 frames/s, 2 MiB/s.</small>
+          </label>
+
+          <div class="upload-actions">
+            <button id="upload-button" type="button" disabled>Upload queue</button>
+            <button id="clear-button" class="secondary" type="button" disabled>Clear</button>
+          </div>
+          <div id="file-list" class="file-list" aria-live="polite"></div>
+        </section>
+
+        <section class="log-panel" aria-labelledby="log-title">
+          <div class="section-heading">
+            <h2 id="log-title">Transport events</h2>
+            <button id="clear-log" class="secondary" type="button">Clear log</button>
+          </div>
+          <ol id="event-log"></ol>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

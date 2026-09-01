@@ -15,7 +15,8 @@ describe("ETP binary codec", () => {
     const frame = decodeFrame(encodeHello());
 
     expect(frame.type).toBe(FrameType.Hello);
-    expect(new TextDecoder().decode(frame.payload.subarray(40))).toBe("client");
+    expect(new TextDecoder().decode(frame.payload.subarray(88))).toBe("client");
+    expect(decodeHello(frame).rateLimits.maxRequestsPerSecond).toBe(200);
   });
 
   it("round trips a JSON event request", () => {
@@ -76,8 +77,13 @@ describe("ETP binary codec", () => {
 
     const hello = decodeFrame(encodeHello());
     const helloPayload = new Uint8Array(hello.payload);
-    new DataView(helloPayload.buffer).setUint32(32, 1, false);
+    helloPayload[80] = 1;
     expect(() => decodeHello({ ...hello, payload: helloPayload })).toThrow("reserved");
+
+	const zeroRate = decodeFrame(encodeHello());
+	const zeroRatePayload = new Uint8Array(zeroRate.payload);
+	new DataView(zeroRatePayload.buffer).setUint32(32, 0, false);
+	expect(() => decodeHello({ ...zeroRate, payload: zeroRatePayload })).toThrow("hello limits");
   });
 
   it("rejects mismatched envelopes and invalid control state", () => {

@@ -17,7 +17,7 @@ suite("Go ETP conformance", () => {
     scope = { onmessage: null, postMessage: (message) => output.push(message), close: () => undefined };
     Object.assign(globalThis, { self: scope });
     await import("./worker");
-    dispatch({ type: "configure", config: { url, timeout: 10_000, reconnection: { enabled: false, attempts: 0, delay: 0, maxDelay: 0 }, protocol: { chunkSize: 16 << 10, maxTransferBytes: 64 << 20, maxConcurrentTransfers: 16, maxInFlightChunks: 16, heartbeatInterval: 10_000, heartbeatTimeout: 20_000, ackTimeout: 2_000, retryLimit: 3, maxFramesPerSecond: 2_000, maxBytesPerSecond: 64 << 20, checksum: true, resumeToken: new Uint8Array() } } });
+    dispatch({ type: "configure", config: { url, timeout: 10_000, reconnection: { enabled: false, attempts: 0, delay: 0, maxDelay: 0 }, protocol: { chunkSize: 16 << 10, maxTransferBytes: 64 << 20, maxConcurrentTransfers: 16, maxInFlightChunks: 16, heartbeatInterval: 10_000, heartbeatTimeout: 20_000, ackTimeout: 2_000, retryLimit: 3, maxRequestsPerSecond: 200, maxFramesPerSecond: 2_000, maxBytesPerSecond: 64 << 20, checksum: true, resumeToken: new Uint8Array() } } });
     dispatch({ type: "connect" });
     await waitFor(() => output.find((message) => message.type === "auth"));
     const auth = output.find((message) => message.type === "auth") as { epoch: number };

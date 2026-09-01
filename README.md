@@ -80,10 +80,29 @@ const socket = io<ClientEvents, ServerEvents>({
     heartbeatTimeout: 20_000,
     ackTimeout: 2_000,
     retryLimit: 3,
+    maxRequestsPerSecond: 200,
+    maxFramesPerSecond: 2_000,
+    maxBytesPerSecond: 64 << 20,
     checksum: true,
   },
 });
 ```
+
+During `HelloAck`, the Go server advertises its request, frame, and byte token
+buckets. The worker paces its outbound queues automatically; file chunks consume
+frame/byte quota but not logical-request quota, and realtime/control traffic is
+scheduled ahead of bulk chunks. These client checks improve behavior only: the
+server enforces every advertised limit even when a modified client ignores them.
+
+## Browser demo
+
+Run the local Go ETP server and Vite client together:
+
+```bash
+npm run demo
+```
+
+Open `http://127.0.0.1:5173`. The demo supports ping/pong requests, generated 8-128 MiB test files, regular file selection, chunk progress, SHA-256 verification, and ping requests during an active upload.
 
 ## Checks
 
@@ -93,4 +112,19 @@ npm test
 npm run test:coverage
 npm run test:go
 npm run build
+npm run package:check
 ```
+
+## Publishing
+
+Package releases are published by `.github/workflows/publish.yml`. Create a
+GitHub Release whose tag exactly matches the package version with a `v` prefix,
+for example `v0.1.0`. The workflow validates TypeScript, unit tests, Go
+conformance, the production build, and the npm tarball before publishing.
+
+For the first release, add an npm granular access token with package publish
+permission and 2FA bypass as the `NPM_TOKEN` repository secret. After the
+package exists, configure npm Trusted Publishing for
+`elum-utils/etp-socket` and workflow `publish.yml`; the workflow already grants
+the required OIDC permission and publishes with provenance. The token secret can
+then be removed.

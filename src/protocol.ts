@@ -22,8 +22,9 @@ export const Capability = {
   Transfers: 1n << 0n, Cancel: 1n << 1n, Ack: 1n << 2n, Nack: 1n << 3n, Heartbeat: 1n << 4n,
   TransferSHA256: 1n << 5n, FlowControl: 1n << 6n, SlowlorisGuard: 1n << 7n, ProtocolEvents: 1n << 8n,
   RequestResponse: 1n << 9n, GracefulClose: 1n << 10n, TransferResume: 1n << 11n, TransferCommit: 1n << 12n,
+  RateLimits: 1n << 13n,
 } as const;
-export const DefaultCapabilities = Capability.Transfers | Capability.Cancel | Capability.Ack | Capability.Nack | Capability.Heartbeat | Capability.TransferSHA256 | Capability.FlowControl | Capability.SlowlorisGuard | Capability.ProtocolEvents | Capability.RequestResponse | Capability.GracefulClose | Capability.TransferCommit;
+export const DefaultCapabilities = Capability.Transfers | Capability.Cancel | Capability.Ack | Capability.Nack | Capability.Heartbeat | Capability.TransferSHA256 | Capability.FlowControl | Capability.SlowlorisGuard | Capability.ProtocolEvents | Capability.RequestResponse | Capability.GracefulClose | Capability.TransferCommit | Capability.RateLimits;
 export const AllCapabilities = DefaultCapabilities | Capability.TransferResume;
 export const CloseFlag = { Immediate: 1 << 0, Drain: 1 << 1, NoNewRequests: 1 << 2, NoNewTransfers: 1 << 3 } as const;
 export const WindowFlag = { Connection: 1 << 0, Transfer: 1 << 1 } as const;
@@ -39,7 +40,8 @@ export type Frame = { type: number; flags: number; priority: number; channel: nu
 export type Field = { key: string; value: string };
 export type TransferPart = { field: string; index: number; name: string; totalSize: bigint; contentType: number };
 export type EventMessage = { event: string; data: unknown; fields?: Field[] };
-export type Hello = { role: string; capabilities: bigint; maxFrameBytes: number; maxChunkSize: number; maxTransferBytes: bigint; maxInFlightChunks: number; heartbeatMillis: number };
+export type RateLimits = { maxRequestsPerSecond: number; requestBurst: number; maxFramesPerSecond: number; frameBurst: number; maxBytesPerSecond: bigint; byteBurst: bigint; availableRequests: number; availableFrames: number; availableBytes: bigint };
+export type Hello = { role: string; capabilities: bigint; maxFrameBytes: number; maxChunkSize: number; maxTransferBytes: bigint; maxInFlightChunks: number; heartbeatMillis: number; rateLimits: RateLimits };
 export type TransferBegin = { totalSize: bigint; chunkSize: number; chunkCount: number; contentType: number; flags: number; checksum: Uint8Array; name: string; event: string; field: string; index: number; parts: TransferPart[]; fields: Field[] };
 export type Ack = { transferID: bigint; chunkFrom: number; chunkTo: number; receivedBytes: bigint };
 export type Nack = { transferID: bigint; chunkFrom: number; chunkTo: number; reasonCode: number; flags: number };
@@ -59,8 +61,9 @@ export function encodeAuth(token: string): ArrayBuffer {
 }
 
 export function encodeHello(hello: Partial<Hello> = {}): ArrayBuffer {
-  const role = encoder.encode(hello.role ?? "client"), payload = new Uint8Array(40 + role.length), view = viewOf(payload);
-  view.setBigUint64(0, hello.capabilities ?? DefaultCapabilities, false); view.setUint32(8, hello.maxFrameBytes ?? MaxFrameBytes, false); view.setUint32(12, hello.maxChunkSize ?? DefaultChunkSize, false); view.setBigUint64(16, hello.maxTransferBytes ?? (512n << 20n), false); view.setUint32(24, hello.maxInFlightChunks ?? 16, false); view.setUint32(28, hello.heartbeatMillis ?? 10_000, false); view.setUint32(36, role.length, false); payload.set(role, 40);
+  const role = encoder.encode(hello.role ?? "client"), limits = hello.rateLimits, payload = new Uint8Array(88 + role.length), view = viewOf(payload);
+  view.setBigUint64(0, hello.capabilities ?? DefaultCapabilities, false); view.setUint32(8, hello.maxFrameBytes ?? MaxFrameBytes, false); view.setUint32(12, hello.maxChunkSize ?? DefaultChunkSize, false); view.setBigUint64(16, hello.maxTransferBytes ?? (512n << 20n), false); view.setUint32(24, hello.maxInFlightChunks ?? 16, false); view.setUint32(28, hello.heartbeatMillis ?? 10_000, false);
+  view.setUint32(32, limits?.maxRequestsPerSecond ?? 200, false); view.setUint32(36, limits?.requestBurst ?? 200, false); view.setUint32(40, limits?.maxFramesPerSecond ?? 2_000, false); view.setUint32(44, limits?.frameBurst ?? 2_000, false); view.setBigUint64(48, limits?.maxBytesPerSecond ?? (64n << 20n), false); view.setBigUint64(56, limits?.byteBurst ?? (64n << 20n), false); view.setUint32(64, limits?.availableRequests ?? limits?.requestBurst ?? 200, false); view.setUint32(68, limits?.availableFrames ?? limits?.frameBurst ?? 2_000, false); view.setBigUint64(72, limits?.availableBytes ?? limits?.byteBurst ?? (64n << 20n), false); view.setUint32(84, role.length, false); payload.set(role, 88);
   return encodeControl(FrameType.Hello, Schema.Hello, payload);
 }
 
@@ -68,7 +71,7 @@ export function encodeRequest(requestID: bigint, event: string, data: unknown, f
 export function encodeResponse(requestID: bigint, event: string, data: unknown, fields: Field[] = []): ArrayBuffer { return encodeEvent(FrameType.Response, requestID, event, data, fields); }
 export function encodePing(): ArrayBuffer { return encodeControl(FrameType.Ping, 0, new Uint8Array()); }
 export function encodePong(): ArrayBuffer { return encodeControl(FrameType.Pong, 0, new Uint8Array()); }
-export function encodeData(transferID: bigint, requestID: bigint, chunkID: number, payload: Uint8Array, first: boolean, last: boolean): ArrayBuffer { return encodeFrame({ type: FrameType.Data, flags: FrameFlag.AckRequest | (first ? FrameFlag.First : 0) | (last ? FrameFlag.Last : 0), priority: Priority.Low, channel: Channel.Bulk, schema: 0, requestID, transferID, chunkID, payload }); }
+export function encodeData(transferID: bigint, requestID: bigint, chunkID: number, payload: Uint8Array, first: boolean, last: boolean, ackRequest = true): ArrayBuffer { return encodeFrame({ type: FrameType.Data, flags: (ackRequest ? FrameFlag.AckRequest : 0) | (first ? FrameFlag.First : 0) | (last ? FrameFlag.Last : 0), priority: Priority.Low, channel: Channel.Bulk, schema: 0, requestID, transferID, chunkID, payload }); }
 export function encodeTransferBegin(transferID: bigint, requestID: bigint, begin: TransferBegin): ArrayBuffer { return encodeFrame({ type: FrameType.TransferBegin, flags: FrameFlag.First, priority: Priority.Low, channel: Channel.Bulk, schema: Schema.TransferBegin, requestID, transferID, chunkID: 0, payload: encodeTransferBeginPayload(begin) }); }
 export function encodeTransferEnd(transferID: bigint, requestID: bigint): ArrayBuffer { return encodeFrame({ type: FrameType.TransferEnd, flags: FrameFlag.Last, priority: Priority.Low, channel: Channel.Bulk, schema: 0, requestID, transferID, chunkID: 0, payload: new Uint8Array() }); }
 export function encodeAck(value: Ack): ArrayBuffer { return encodeControl(FrameType.Ack, Schema.Ack, encodeAckPayload(value), value.transferID); }
@@ -103,15 +106,16 @@ export function decodeEvent(frame: Frame): EventMessage {
   return fields.length ? { event, data, fields } : { event, data };
 }
 export function decodeHello(frame: Frame): Hello {
-  if (frame.schema !== Schema.Hello || frame.payload.length < 40) throw new ProtocolError("invalid ETP hello frame"); const view = viewOf(frame.payload), end = checkedEnd(frame.payload, 40, view.getUint32(36, false));
+  if (frame.schema !== Schema.Hello || frame.payload.length < 88) throw new ProtocolError("invalid ETP hello frame"); const view = viewOf(frame.payload), end = checkedEnd(frame.payload, 88, view.getUint32(84, false));
   if (end === undefined || end !== frame.payload.length) throw new ProtocolError("invalid ETP hello payload");
-  if (!isZero(frame.payload.subarray(32, 36))) throw new ProtocolError("invalid ETP hello reserved bytes");
-  const hello = { capabilities: view.getBigUint64(0, false), maxFrameBytes: view.getUint32(8, false), maxChunkSize: view.getUint32(12, false), maxTransferBytes: view.getBigUint64(16, false), maxInFlightChunks: view.getUint32(24, false), heartbeatMillis: view.getUint32(28, false), role: decodeUTF8(frame.payload.subarray(40)) };
-  if (hello.maxFrameBytes < HeaderSize || hello.maxFrameBytes > MaxFrameBytes || hello.maxChunkSize === 0 || hello.maxChunkSize > hello.maxFrameBytes - HeaderSize || hello.maxTransferBytes === 0n || hello.maxInFlightChunks === 0 || hello.heartbeatMillis === 0) throw new ProtocolError("invalid ETP hello limits"); return hello;
+  if (!isZero(frame.payload.subarray(80, 84))) throw new ProtocolError("invalid ETP hello reserved bytes");
+  const rateLimits = { maxRequestsPerSecond: view.getUint32(32, false), requestBurst: view.getUint32(36, false), maxFramesPerSecond: view.getUint32(40, false), frameBurst: view.getUint32(44, false), maxBytesPerSecond: view.getBigUint64(48, false), byteBurst: view.getBigUint64(56, false), availableRequests: view.getUint32(64, false), availableFrames: view.getUint32(68, false), availableBytes: view.getBigUint64(72, false) };
+  const hello = { capabilities: view.getBigUint64(0, false), maxFrameBytes: view.getUint32(8, false), maxChunkSize: view.getUint32(12, false), maxTransferBytes: view.getBigUint64(16, false), maxInFlightChunks: view.getUint32(24, false), heartbeatMillis: view.getUint32(28, false), rateLimits, role: decodeUTF8(frame.payload.subarray(88)) };
+  if (hello.maxFrameBytes < HeaderSize || hello.maxFrameBytes > MaxFrameBytes || hello.maxChunkSize === 0 || hello.maxChunkSize > hello.maxFrameBytes - HeaderSize || hello.maxTransferBytes === 0n || hello.maxInFlightChunks === 0 || hello.heartbeatMillis === 0 || rateLimits.maxRequestsPerSecond === 0 || rateLimits.requestBurst === 0 || rateLimits.maxFramesPerSecond === 0 || rateLimits.frameBurst === 0 || rateLimits.maxBytesPerSecond === 0n || rateLimits.byteBurst === 0n || rateLimits.availableRequests > rateLimits.requestBurst || rateLimits.availableFrames > rateLimits.frameBurst || rateLimits.availableBytes > rateLimits.byteBurst) throw new ProtocolError("invalid ETP hello limits"); return hello;
 }
-export function decodeAuthReject(frame: Frame): string { if (frame.payload.length < 8) throw new ProtocolError("invalid ETP auth rejection"); const view = viewOf(frame.payload), end = checkedEnd(frame.payload, 8, view.getUint32(4, false)); if (end === undefined || end !== frame.payload.length) throw new ProtocolError("invalid ETP auth rejection message"); return decodeUTF8(frame.payload.subarray(8)); }
-export function decodeAuthAccept(frame: Frame): string { if (frame.payload.length < 4) throw new ProtocolError("invalid ETP auth acceptance"); const view = viewOf(frame.payload), end = checkedEnd(frame.payload, 4, view.getUint32(0, false)); if (end === undefined || end !== frame.payload.length) throw new ProtocolError("invalid ETP auth acceptance user id"); return decodeUTF8(frame.payload.subarray(4)); }
-export function decodeText(frame: Frame): string { if (frame.payload.length < 4) throw new ProtocolError("invalid ETP text message"); const view = viewOf(frame.payload), end = checkedEnd(frame.payload, 4, view.getUint32(0, false)); if (end === undefined || end !== frame.payload.length) throw new ProtocolError("invalid ETP text message length"); return decodeUTF8(frame.payload.subarray(4)); }
+export function decodeAuthReject(frame: Frame): string { return decodeSizedText(frame.payload, 8, 4, "auth rejection"); }
+export function decodeAuthAccept(frame: Frame): string { return decodeSizedText(frame.payload, 4, 0, "auth acceptance"); }
+export function decodeText(frame: Frame): string { return decodeSizedText(frame.payload, 4, 0, "text message"); }
 export function decodeError(frame: Frame): ErrorMessage { return decodeErrorPayload(frame.payload); }
 export function decodeGoAway(frame: Frame): GoAway { if (frame.schema !== Schema.GoAway) throw new ProtocolError("invalid goaway schema"); return decodeGoAwayPayload(frame.payload); }
 export function decodeClose(frame: Frame): CloseMessage { if (frame.schema !== Schema.Close) throw new ProtocolError("invalid close schema"); return decodeClosePayload(frame.payload); }
@@ -181,5 +185,6 @@ function validateCloseFlags(flags: number): void { if (flags & ~knownCloseFlags 
 function readLengthEnd(payload: Uint8Array, view: DataView, pos: number): { start: number; end: number; next: number } { if (pos + 4 > payload.length) throw new ProtocolError("invalid payload length"); const start = pos + 4, end = checkedEnd(payload, start, view.getUint32(pos, false)); if (end === undefined) throw new ProtocolError("invalid payload length"); return { start, end, next: end }; }
 function checkedEnd(payload: Uint8Array, start: number, length: number): number | undefined { return start <= payload.length && length <= payload.length - start ? start + length : undefined; }
 function viewOf(data: Uint8Array): DataView { return new DataView(data.buffer, data.byteOffset, data.byteLength); }
+function decodeSizedText(payload: Uint8Array, dataOffset: number, lengthOffset: number, label: string): string { if (payload.length < dataOffset) throw new ProtocolError(`invalid ETP ${label}`); const end = checkedEnd(payload, dataOffset, viewOf(payload).getUint32(lengthOffset, false)); if (end !== payload.length) throw new ProtocolError(`invalid ETP ${label}`); return decodeUTF8(payload.subarray(dataOffset)); }
 function decodeUTF8(data: Uint8Array): string { try { return decoder.decode(data); } catch { throw new ProtocolError("invalid UTF-8 payload"); } }
 function isZero(data: Uint8Array): boolean { return data.every((value) => value === 0); }

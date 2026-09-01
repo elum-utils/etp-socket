@@ -53,6 +53,7 @@ export type ProtocolOptions = {
   heartbeatTimeout?: number;
   ackTimeout?: number;
   retryLimit?: number;
+  maxRequestsPerSecond?: number;
   maxFramesPerSecond?: number;
   maxBytesPerSecond?: number;
   checksum?: boolean;
@@ -68,10 +69,38 @@ export type SocketOptions = {
   protocol?: ProtocolOptions;
 };
 
+export type WorkerConfig = {
+  url: string;
+  timeout: number;
+  reconnection: Required<ReconnectionOptions>;
+  protocol: Required<ProtocolOptions>;
+};
+
+export type MainMessage =
+  | { type: "configure"; config: WorkerConfig }
+  | { type: "connect" | "disconnect" | "terminate" }
+  | { type: "auth"; epoch: number; token?: string; error?: string }
+  | { type: "emit"; callID: number; event: string; data: unknown }
+  | { type: "respond"; requestID: bigint; event: string; data: unknown }
+  | { type: "cancel"; callID: number };
+
+export type WorkerMessage =
+  | { type: "auth"; epoch: number }
+  | { type: "status"; state: SocketState }
+  | { type: "disconnect"; reason: DisconnectReason }
+  | { type: "event"; event: string; data: unknown; requestID?: bigint }
+  | { type: "text"; text: string }
+  | { type: "identity"; identity: SocketIdentity }
+  | { type: "response"; callID: number; data?: unknown; error?: { code: SocketErrorCode; message: string } }
+  | { type: "error"; error: { code: SocketErrorCode; message: string } }
+  | { type: "progress"; progress: TransferProgress }
+  | { type: "protocol"; event: ProtocolEvent };
+
 export type EmitCallback<Response> = (error: SocketError | null, response?: Response) => void;
 
 export type EmitOptions = {
   signal?: AbortSignal;
+  transfer?: boolean;
 };
 
 export type TransferProgress = {

@@ -13,6 +13,7 @@ class FakeWebSocket {
 
   binaryType = "blob";
   readyState = FakeWebSocket.CONNECTING;
+  bufferedAmount = 0;
   onopen: (() => void) | null = null;
   onmessage: ((event: MessageEvent<ArrayBuffer>) => void) | null = null;
   onerror: (() => void) | null = null;
@@ -45,6 +46,25 @@ class FakeWebSocket {
   }
 }
 
+class FakeMessagePort {
+  peer?: FakeMessagePort;
+  onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+
+  postMessage(data: unknown): void {
+    setTimeout(() => this.peer?.onmessage?.({ data } as MessageEvent<unknown>), 0);
+  }
+}
+
+class FakeMessageChannel {
+  readonly port1 = new FakeMessagePort();
+  readonly port2 = new FakeMessagePort();
+
+  constructor() {
+    this.port1.peer = this.port2;
+    this.port2.peer = this.port1;
+  }
+}
+
 type Scope = {
   onmessage: ((event: MessageEvent<unknown>) => void) | null;
   postMessage(message: WorkerOutput): void;
@@ -67,6 +87,7 @@ describe("ETP socket worker", () => {
     };
     vi.stubGlobal("self", scope);
     vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("MessageChannel", FakeMessageChannel);
     vi.resetModules();
     await import("./worker");
   });
@@ -121,6 +142,25 @@ describe("ETP socket worker", () => {
     payload.set(text, 4);
     connection.receive(serverFrame(FrameType.Data, payload, Schema.Text, 5n, FrameFlag.First | FrameFlag.Last));
     expect(output).toContainEqual({ type: "text", text: "hello" });
+  });
+
+  it("reports when the incoming frame rate limit is exceeded", () => {
+    const connection = openConnection();
+    vi.advanceTimersByTime(1_000);
+    for (let index = 0; index <= 2_000; index += 1) {
+      connection.receive(encodeWindow({ transferID: 1n, windowBytes: 1n, windowChunks: 1, flags: WindowFlag.Transfer }));
+    }
+    expect(output).toContainEqual({ type: "error", error: { code: "protocol", message: "incoming ETP rate limit exceeded: frames" } });
+    expect(connection.readyState).toBe(FakeWebSocket.CLOSED);
+  });
+
+  it("enforces the request limit it advertises to the server", () => {
+    const connection = openConnection(0x37ffn, 10_000, undefined, 1);
+    connection.receive(encodeRequest(9001n, "server.first", {}));
+    expect(output).toContainEqual({ type: "event", event: "server.first", data: {}, requestID: 9001n });
+    connection.receive(encodeRequest(9002n, "server.second", {}));
+    expect(output).toContainEqual({ type: "error", error: { code: "protocol", message: "incoming ETP rate limit exceeded: requests" } });
+    expect(connection.readyState).toBe(FakeWebSocket.CLOSED);
   });
 
   it("answers ping and sends an idle heartbeat from the worker", () => {
@@ -258,12 +298,184 @@ describe("ETP socket worker", () => {
     await vi.waitFor(() => expect(connection.sent.some((value) => decodeFrame(value).type === FrameType.TransferBegin)).toBe(true));
     const begin = decodeFrame(connection.sent.find((value) => decodeFrame(value).type === FrameType.TransferBegin)!);
     connection.receive(encodeWindow({ transferID: begin.transferID, windowBytes: 1n << 20n, windowChunks: 16, flags: WindowFlag.Transfer }));
+    await vi.advanceTimersByTimeAsync(20);
     const chunks = connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Data);
     expect(chunks.length).toBeGreaterThan(1);
     let received = 0;
     for (const chunk of chunks) { received += chunk.payload.length; connection.receive(encodeAck({ transferID: begin.transferID, chunkFrom: chunk.chunkID, chunkTo: chunk.chunkID, receivedBytes: BigInt(received) })); }
+    await vi.advanceTimersByTimeAsync(1);
     expect(decodeFrame(connection.sent.at(-1)!).type).toBe(FrameType.TransferEnd);
     connection.receive(encodeTransferState({ transferID: begin.transferID, receivedBytes: BigInt(70 << 10), nextChunk: chunks.length, flags: TransferStateFlag.Completed, reasonCode: 0 }));
+  });
+
+  it("does not exceed max in-flight chunks when receiver windows arrive before ACKs", async () => {
+    const connection = openConnection();
+    dispatch({ type: "emit", callID: 22, event: "message.large", data: new Uint8Array(512 << 10) });
+    await vi.waitFor(() => expect(connection.sent.some((value) => decodeFrame(value).type === FrameType.TransferBegin)).toBe(true));
+    const begin = connection.sent.map(decodeFrame).find((frame) => frame.type === FrameType.TransferBegin)!;
+    const window = encodeWindow({ transferID: begin.transferID, windowBytes: 1n << 20n, windowChunks: 16, flags: WindowFlag.Transfer });
+
+    connection.receive(window);
+    connection.receive(window);
+    await vi.advanceTimersByTimeAsync(20);
+
+    const chunks = connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Data);
+    expect(chunks).toHaveLength(16);
+    expect(chunks.filter((frame) => frame.flags & FrameFlag.AckRequest)).toHaveLength(2);
+  });
+
+  it("sends realtime requests before queued bulk chunks", async () => {
+    const connection = openConnection();
+    dispatch({ type: "emit", callID: 23, event: "upload", data: new Uint8Array(512 << 10) });
+    await vi.waitFor(() => expect(connection.sent.some((value) => decodeFrame(value).type === FrameType.TransferBegin)).toBe(true));
+    const begin = connection.sent.map(decodeFrame).find((frame) => frame.type === FrameType.TransferBegin)!;
+    connection.receive(encodeWindow({ transferID: begin.transferID, windowBytes: 1n << 20n, windowChunks: 16, flags: WindowFlag.Transfer }));
+
+    await vi.advanceTimersToNextTimerAsync();
+    const firstData = connection.sent.map(decodeFrame).findIndex((frame) => frame.type === FrameType.Data);
+    expect(firstData).toBeGreaterThanOrEqual(0);
+
+    connection.bufferedAmount = 256 << 10;
+    dispatch({ type: "emit", callID: 24, event: "message.send", data: { text: "priority" } });
+    await vi.advanceTimersByTimeAsync(20);
+    let frames = connection.sent.map(decodeFrame);
+    expect(frames.filter((frame) => frame.type === FrameType.Data)).toHaveLength(8);
+    connection.bufferedAmount = 0;
+    await vi.advanceTimersByTimeAsync(20);
+    frames = connection.sent.map(decodeFrame);
+    const request = frames.findIndex((frame) => frame.type === FrameType.Request);
+    const data = frames.map((frame, index) => frame.type === FrameType.Data ? index : -1).filter((index) => index >= 0);
+    expect(request).toBeGreaterThan(firstData);
+    expect(request).toBeLessThan(data[8]);
+  });
+
+  it("paces requests using server limits and starts timeout only after the frame is sent", async () => {
+    const limits = { requests: 1, requestBurst: 1, frames: 100, frameBurst: 100, bytes: 1n << 20n, byteBurst: 1n << 20n };
+    const connection = openConnection(0x37ffn, 500, limits);
+    dispatch({ type: "emit", callID: 101, event: "first", data: {} });
+    dispatch({ type: "emit", callID: 102, event: "second", data: {} });
+
+    expect(connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Request)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(output.some((message) => message.type === "response" && message.callID === 102)).toBe(false);
+    expect(connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Request)).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(400);
+    expect(connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Request)).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(output.some((message) => message.type === "response" && message.callID === 102)).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(output).toContainEqual({ type: "response", callID: 102, data: undefined, error: { code: "timeout", message: "request timed out" } });
+  });
+
+  it("starts pacing from the server-advertised remaining quota", async () => {
+    const limits = {
+      requests: 10,
+      requestBurst: 10,
+      frames: 100,
+      frameBurst: 100,
+      bytes: 1n << 20n,
+      byteBurst: 1n << 20n,
+      availableRequests: 0,
+      availableFrames: 100,
+      availableBytes: 1n << 20n,
+    };
+    const connection = openConnection(0x37ffn, 10_000, limits);
+    dispatch({ type: "emit", callID: 105, event: "message.send", data: {} });
+
+    expect(connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Request)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Request)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Request)).toHaveLength(1);
+  });
+
+  it("gives a realtime request the next frame token ahead of queued file chunks", async () => {
+    const limits = { requests: 100, requestBurst: 100, frames: 2, frameBurst: 2, bytes: 1n << 20n, byteBurst: 1n << 20n };
+    const connection = openConnection(0x37ffn, 10_000, limits);
+    dispatch({ type: "emit", callID: 103, event: "upload", data: new Uint8Array(64 << 10) });
+    await vi.waitFor(() => expect(connection.sent.some((value) => decodeFrame(value).type === FrameType.TransferBegin)).toBe(true));
+    const begin = connection.sent.map(decodeFrame).find((frame) => frame.type === FrameType.TransferBegin)!;
+    connection.receive(encodeWindow({ transferID: begin.transferID, windowBytes: 64n << 10n, windowChunks: 4, flags: WindowFlag.Transfer }));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Data)).toHaveLength(1);
+
+    dispatch({ type: "emit", callID: 104, event: "message.send", data: { text: "priority" } });
+    await vi.advanceTimersByTimeAsync(499);
+    const frames = connection.sent.map(decodeFrame);
+    const requestIndex = frames.findIndex((frame) => frame.type === FrameType.Request);
+    const dataIndexes = frames.map((frame, index) => frame.type === FrameType.Data ? index : -1).filter((index) => index >= 0);
+    expect(requestIndex).toBeGreaterThan(dataIndexes[0]);
+    expect(dataIndexes).toHaveLength(1);
+  });
+
+  it("coalesces chunk progress without delaying the exact terminal update", async () => {
+    const connection = openConnection();
+    const total = 512 << 10;
+    dispatch({ type: "emit", callID: 41, event: "upload", data: new Uint8Array(total) });
+    await vi.waitFor(() => expect(connection.sent.some((value) => decodeFrame(value).type === FrameType.TransferBegin)).toBe(true));
+    const begin = connection.sent.map(decodeFrame).find((frame) => frame.type === FrameType.TransferBegin)!;
+    connection.receive(encodeWindow({ transferID: begin.transferID, windowBytes: 1n << 20n, windowChunks: 64, flags: WindowFlag.Transfer }));
+    await vi.advanceTimersByTimeAsync(20);
+
+    let acknowledgedChunks = 0, receivedBytes = 0;
+    for (let batch = 0; batch < 4 && !connection.sent.map(decodeFrame).some((frame) => frame.type === FrameType.TransferEnd); batch += 1) {
+      const chunks = connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Data);
+      const unacknowledged = chunks.slice(acknowledgedChunks);
+      expect(unacknowledged.length).toBeGreaterThan(0);
+      receivedBytes += unacknowledged.reduce((sum, frame) => sum + frame.payload.byteLength, 0);
+      acknowledgedChunks = chunks.length;
+      connection.receive(encodeAck({ transferID: begin.transferID, chunkFrom: unacknowledged[0].chunkID, chunkTo: unacknowledged.at(-1)!.chunkID, receivedBytes: BigInt(receivedBytes) }));
+      await vi.advanceTimersByTimeAsync(20);
+    }
+    expect(connection.sent.map(decodeFrame).some((frame) => frame.type === FrameType.TransferEnd)).toBe(true);
+    connection.receive(encodeTransferState({ transferID: begin.transferID, receivedBytes: BigInt(receivedBytes), nextChunk: acknowledgedChunks, flags: TransferStateFlag.Completed, reasonCode: 0 }));
+
+    const progress = output.filter((message) => message.type === "progress").map((message) => message.progress as { acknowledgedBytes: number; state: string });
+    expect(progress.length).toBeLessThan(acknowledgedChunks);
+    expect(progress.at(-1)).toMatchObject({ acknowledgedBytes: receivedBytes, state: "completed" });
+  });
+
+  it("drops queued chunks when an outgoing request is canceled", async () => {
+    const connection = openConnection();
+    dispatch({ type: "emit", callID: 25, event: "upload", data: new Uint8Array(512 << 10) });
+    await vi.waitFor(() => expect(connection.sent.some((value) => decodeFrame(value).type === FrameType.TransferBegin)).toBe(true));
+    const begin = connection.sent.map(decodeFrame).find((frame) => frame.type === FrameType.TransferBegin)!;
+    connection.receive(encodeWindow({ transferID: begin.transferID, windowBytes: 1n << 20n, windowChunks: 16, flags: WindowFlag.Transfer }));
+    dispatch({ type: "cancel", callID: 25 });
+    await vi.advanceTimersByTimeAsync(20);
+
+    const frames = connection.sent.map(decodeFrame);
+    expect(frames.filter((frame) => frame.type === FrameType.Data)).toHaveLength(0);
+    expect(frames.at(-1)?.type).toBe(FrameType.Cancel);
+  });
+
+  it("does not start ACK timeouts while bulk frames wait for WebSocket backpressure", async () => {
+    const connection = openConnection(0x37ffn, 20_000);
+    dispatch({ type: "emit", callID: 26, event: "upload", data: new Uint8Array(16 << 10) });
+    await vi.waitFor(() => expect(connection.sent.some((value) => decodeFrame(value).type === FrameType.TransferBegin)).toBe(true));
+    const begin = connection.sent.map(decodeFrame).find((frame) => frame.type === FrameType.TransferBegin)!;
+    connection.bufferedAmount = 256 << 10;
+    connection.receive(encodeWindow({ transferID: begin.transferID, windowBytes: 16n << 10n, windowChunks: 1, flags: WindowFlag.Transfer }));
+    for (let second = 0; second < 7; second += 1) await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Data)).toHaveLength(0);
+    expect(output.some((message) => message.type === "response" && message.callID === 26)).toBe(false);
+    connection.bufferedAmount = 0;
+    await vi.advanceTimersByTimeAsync(2);
+    expect(connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Data)).toHaveLength(1);
+  });
+
+  it("batches ACK and WINDOW frames while receiving a transfer", () => {
+    const connection = openConnection(), transferID = 8000n, requestID = 9000n;
+    connection.receive(encodeTransferBegin(transferID, requestID, { totalSize: 64n, chunkSize: 4, chunkCount: 16, contentType: 1, flags: 0, checksum: new Uint8Array(32), name: "x.bin", event: "attach.ready", field: "", index: 0, parts: [], fields: [] }));
+    for (let chunkID = 0; chunkID < 16; chunkID += 1) {
+      const last = chunkID === 15;
+      connection.receive(encodeData(transferID, requestID, chunkID, new Uint8Array(4), chunkID === 0, last, chunkID === 7 || last));
+    }
+    const frames = connection.sent.map(decodeFrame);
+    expect(frames.filter((frame) => frame.type === FrameType.Ack)).toHaveLength(2);
+    expect(frames.filter((frame) => frame.type === FrameType.Window)).toHaveLength(2);
   });
 
   it("receives and verifies a checksum transfer as a Blob event", async () => {
@@ -312,33 +524,37 @@ describe("ETP socket worker", () => {
     await vi.waitFor(() => expect(connection.sent.some((item) => decodeFrame(item).type === FrameType.TransferBegin)).toBe(true));
     const begin = connection.sent.map(decodeFrame).find((frame) => frame.type === FrameType.TransferBegin)!;
     connection.receive(encodeWindow({ transferID: begin.transferID, windowBytes: 32n << 10n, windowChunks: 2, flags: WindowFlag.Transfer }));
+    await vi.advanceTimersByTimeAsync(2);
     const before = connection.sent.length;
     connection.receive(encodeNack({ transferID: begin.transferID, chunkFrom: 0, chunkTo: 0, reasonCode: 1, flags: 0 }));
+    await vi.advanceTimersByTimeAsync(1);
     expect(connection.sent.length).toBe(before + 1);
     connection.receive(encodeNack({ transferID: begin.transferID, chunkFrom: 0, chunkTo: 0, reasonCode: 7, flags: 0 }));
     connection.receive(encodeNack({ transferID: begin.transferID, chunkFrom: 0, chunkTo: 0, reasonCode: 5, flags: 0 }));
-    expect(output).toContainEqual({ type: "response", callID: 32, data: undefined, error: { code: "protocol", message: "remote rejected transfer with reason 5" } });
+    expect(output).toContainEqual({ type: "response", callID: 32, data: undefined, error: { code: "protocol", message: "remote rejected transfer: receiver write failed (reason 5)" } });
   });
 
   it("resumes an outgoing transfer after reconnect", async () => {
-    const connection = openConnection(0x1fffn);
+    const connection = openConnection(0x3fffn);
     dispatch({ type: "emit", callID: 33, event: "upload", data: new Uint8Array(32 << 10) });
     await vi.waitFor(() => expect(connection.sent.some((item) => decodeFrame(item).type === FrameType.TransferBegin)).toBe(true));
     const begin = connection.sent.map(decodeFrame).find((frame) => frame.type === FrameType.TransferBegin)!;
     connection.receive(encodeWindow({ transferID: begin.transferID, windowBytes: 16n << 10n, windowChunks: 1, flags: WindowFlag.Transfer }));
+    await vi.advanceTimersByTimeAsync(1);
     const chunk = connection.sent.map(decodeFrame).find((frame) => frame.type === FrameType.Data)!;
     connection.receive(encodeAck({ transferID: begin.transferID, chunkFrom: 0, chunkTo: 0, receivedBytes: BigInt(chunk.payload.length) }));
     connection.close();
     vi.advanceTimersByTime(1_000);
     const auth = output.filter((message) => message.type === "auth").at(-1) as { epoch: number };
     dispatch({ type: "auth", epoch: auth.epoch, token: "token-2" });
-    const resumed = latestSocket(); resumed.open(); resumed.receive(serverAuthAccept("account-1")); resumed.receive(serverHello("server", 0x1fffn));
+    const resumed = latestSocket(); resumed.open(); resumed.receive(serverAuthAccept("account-1")); resumed.receive(serverHello("server", 0x3fffn));
     const resumeFrame = resumed.sent.map(decodeFrame).find((frame) => frame.type === FrameType.TransferResume)!;
     const resume = decodeTransferResume(resumeFrame);
     expect(resume.transferID).toBe(begin.transferID);
     expect(resume.receivedBytes).toBe(BigInt(chunk.payload.length));
     resumed.receive(encodeTransferState({ transferID: begin.transferID, receivedBytes: resume.receivedBytes, nextChunk: 1, flags: TransferStateFlag.ResumeAccepted, reasonCode: 0 }));
     resumed.receive(encodeWindow({ transferID: begin.transferID, windowBytes: 16n << 10n, windowChunks: 1, flags: WindowFlag.Transfer }));
+    await vi.advanceTimersByTimeAsync(1);
     expect(resumed.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Data)).toHaveLength(1);
   });
 
@@ -361,17 +577,19 @@ describe("ETP socket worker", () => {
   });
 
   it("retries unacknowledged chunks and fails at the configured retry limit", async () => {
-    const connection = openConnection();
+    const connection = openConnection(0x37ffn, 20_000);
     dispatch({ type: "emit", callID: 34, event: "upload", data: new Uint8Array(16 << 10) });
     await vi.waitFor(() => expect(connection.sent.some((item) => decodeFrame(item).type === FrameType.TransferBegin)).toBe(true));
     const begin = connection.sent.map(decodeFrame).find((frame) => frame.type === FrameType.TransferBegin)!;
     connection.receive(encodeWindow({ transferID: begin.transferID, windowBytes: 16n << 10n, windowChunks: 1, flags: WindowFlag.Transfer }));
-    vi.advanceTimersByTime(9_000);
+    await vi.advanceTimersByTimeAsync(1);
+    for (let second = 0; second < 12; second += 1) await vi.advanceTimersByTimeAsync(1_000);
+    expect(connection.sent.map(decodeFrame).filter((frame) => frame.type === FrameType.Data)).toHaveLength(4);
     expect(output).toContainEqual({ type: "response", callID: 34, data: undefined, error: { code: "timeout", message: "transfer acknowledgment timed out" } });
   });
 
   it("fails checksum-corrupt downloads and resumes a partial incoming transfer", async () => {
-    const connection = openConnection(0x1fffn), transferID = 8100n, requestID = 9100n, body = new TextEncoder().encode("chunk");
+    const connection = openConnection(0x3fffn), transferID = 8100n, requestID = 9100n, body = new TextEncoder().encode("chunk");
     connection.receive(encodeTransferBegin(transferID, requestID, { totalSize: BigInt(body.length), chunkSize: body.length, chunkCount: 1, contentType: 1, flags: TransferFlag.ChecksumSHA256, checksum: new Uint8Array(32), name: "x", event: "download", field: "", index: 0, parts: [], fields: [] }));
     connection.receive(encodeData(transferID, requestID, 0, body, true, true));
     connection.receive(encodeTransferEnd(transferID, requestID));
@@ -405,27 +623,27 @@ describe("ETP socket worker", () => {
     expect(connection.readyState).toBe(FakeWebSocket.CLOSED);
   });
 
-  function connect(): void {
+  function connect(timeout = 10_000, maxRequestsPerSecond = 200): void {
     dispatch({
       type: "configure",
       config: {
         url: "wss://example.test/ws",
-        timeout: 10_000,
+        timeout,
         reconnection: { enabled: true, attempts: 5, delay: 1_000, maxDelay: 10_000 },
-        protocol: { chunkSize: 16 << 10, maxTransferBytes: 64 << 20, maxConcurrentTransfers: 16, maxInFlightChunks: 16, heartbeatInterval: 10_000, heartbeatTimeout: 20_000, ackTimeout: 2_000, retryLimit: 3, maxFramesPerSecond: 2_000, maxBytesPerSecond: 64 << 20, checksum: true, resumeToken: new Uint8Array() },
+        protocol: { chunkSize: 16 << 10, maxTransferBytes: 64 << 20, maxConcurrentTransfers: 16, maxInFlightChunks: 16, heartbeatInterval: 10_000, heartbeatTimeout: 20_000, ackTimeout: 2_000, retryLimit: 3, maxRequestsPerSecond, maxFramesPerSecond: 2_000, maxBytesPerSecond: 64 << 20, checksum: true, resumeToken: new Uint8Array() },
       },
     });
     dispatch({ type: "connect" });
   }
 
-  function openConnection(capabilities = 0x17ffn): FakeWebSocket {
-    connect();
+  function openConnection(capabilities = 0x37ffn, timeout = 10_000, limits?: ServerLimits, maxRequestsPerSecond = 200): FakeWebSocket {
+    connect(timeout, maxRequestsPerSecond);
     const authRequest = output.filter((message) => message.type === "auth").at(-1) as { epoch: number };
     dispatch({ type: "auth", epoch: authRequest.epoch, token: "token" });
     const connection = latestSocket();
     connection.open();
     connection.receive(serverAuthAccept("account-1"));
-    connection.receive(serverHello("server", capabilities));
+    connection.receive(serverHello("server", capabilities, limits));
     return connection;
   }
 
@@ -461,9 +679,21 @@ function serverAuthReject(message: string): ArrayBuffer {
   return serverFrame(FrameType.AuthReject, payload, 205);
 }
 
-function serverHello(role: string, capabilities = 0x17ffn): ArrayBuffer {
+type ServerLimits = {
+  requests: number;
+  requestBurst: number;
+  frames: number;
+  frameBurst: number;
+  bytes: bigint;
+  byteBurst: bigint;
+  availableRequests?: number;
+  availableFrames?: number;
+  availableBytes?: bigint;
+};
+
+function serverHello(role: string, capabilities = 0x37ffn, limits: ServerLimits = { requests: 200, requestBurst: 200, frames: 2_000, frameBurst: 2_000, bytes: 64n << 20n, byteBurst: 64n << 20n }): ArrayBuffer {
   const roleBytes = new TextEncoder().encode(role);
-  const payload = new Uint8Array(40 + roleBytes.length);
+  const payload = new Uint8Array(88 + roleBytes.length);
   const view = new DataView(payload.buffer);
   view.setBigUint64(0, capabilities, false);
   view.setUint32(8, 8 << 20, false);
@@ -471,8 +701,17 @@ function serverHello(role: string, capabilities = 0x17ffn): ArrayBuffer {
   view.setBigUint64(16, 512n << 20n, false);
   view.setUint32(24, 16, false);
   view.setUint32(28, 10_000, false);
-  view.setUint32(36, roleBytes.length, false);
-  payload.set(roleBytes, 40);
+  view.setUint32(32, limits.requests, false);
+  view.setUint32(36, limits.requestBurst, false);
+  view.setUint32(40, limits.frames, false);
+  view.setUint32(44, limits.frameBurst, false);
+  view.setBigUint64(48, limits.bytes, false);
+  view.setBigUint64(56, limits.byteBurst, false);
+  view.setUint32(64, limits.availableRequests ?? limits.requestBurst, false);
+  view.setUint32(68, limits.availableFrames ?? limits.frameBurst, false);
+  view.setBigUint64(72, limits.availableBytes ?? limits.byteBurst, false);
+  view.setUint32(84, roleBytes.length, false);
+  payload.set(roleBytes, 88);
   return serverFrame(FrameType.HelloAck, payload, 1);
 }
 

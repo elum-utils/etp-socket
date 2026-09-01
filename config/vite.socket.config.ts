@@ -1,6 +1,5 @@
 import { resolve } from "node:path";
 
-import copy from "rollup-plugin-copy";
 import { defineConfig } from "vite";
 
 export default defineConfig({
@@ -8,7 +7,7 @@ export default defineConfig({
   base: "./",
   build: {
     outDir: "../dist",
-    emptyOutDir: false,
+    emptyOutDir: true,
     copyPublicDir: false,
     target: "esnext",
     minify: "terser",
@@ -28,13 +27,4 @@ export default defineConfig({
       fileName: "index",
     },
   },
-  plugins: [
-    copy({
-      targets: [
-        { src: "LICENSE", dest: "dist" },
-        { src: "README.md", dest: "dist" },
-        { src: "src/package.json", dest: "dist", rename: "package.json" },
-      ],
-    }),
-  ],
 });

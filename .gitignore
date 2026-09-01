@@ -1,4 +1,15 @@
 node_modules/
 dist/
 coverage/
+.vite/
+*.tgz
+*.log
+.env
+.env.*
+!.env.example
 .DS_Store
+.idea/
+.vscode/
+/examples/browser/server/server
+/integration/go-server/go-server
+*.test

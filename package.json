@@ -1,23 +1,64 @@
 {
+  "name": "@elum/etp-socket",
+  "version": "0.1.0",
+  "description": "Socket.IO-like browser client for Elum Transport Protocol",
+  "license": "MIT",
   "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elum-utils/etp-socket.git"
+  },
+  "homepage": "https://github.com/elum-utils/etp-socket#readme",
+  "bugs": {
+    "url": "https://github.com/elum-utils/etp-socket/issues"
+  },
+  "keywords": [
+    "etp",
+    "websocket",
+    "realtime",
+    "transport",
+    "socket"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build:socket": "vite build --config config/vite.socket.config.ts",
     "tsc:socket": "rollup --config config/rollup.socket.config.ts",
-    "build": "npm run build:socket && npm run tsc:socket",
+    "build": "npm run clean && npm run build:socket && npm run tsc:socket",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "test:go": "bash integration/run-conformance.sh"
+    "test:go": "bash integration/run-conformance.sh",
+    "package:check": "npm pack --dry-run",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check && npm test",
+    "demo": "node examples/browser/run.mjs",
+    "demo:web": "vite --config examples/browser/vite.config.ts",
+    "demo:server": "cd examples/browser/server && go run ."
   },
   "devDependencies": {
-    "@rollup/plugin-typescript": "^12.1.2",
     "@types/node": "^22.13.0",
     "@vitest/coverage-v8": "^3.2.7",
     "rollup": "^4.34.0",
-    "rollup-plugin-copy": "^3.5.0",
     "rollup-plugin-dts": "^6.1.1",
     "terser": "^5.37.0",
-    "tslib": "^2.8.1",
     "typescript": "^5.7.3",
     "vite": "^6.0.11",
     "vitest": "^3.2.4"

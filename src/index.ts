@@ -7,14 +7,15 @@ import {
   type EmitOptions,
   type EventResponder,
   type ProtocolEvent,
-  type ProtocolOptions,
   type ReconnectionOptions,
   type ServerEvents,
   type Socket,
-  type SocketErrorCode,
   type SocketOptions,
   type SocketIdentity,
   type TransferProgress,
+  type MainMessage,
+  type WorkerConfig,
+  type WorkerMessage,
 } from "./types";
 import Worker from "./worker?worker&inline";
 
@@ -24,28 +25,6 @@ type Pending = {
   callback?: EmitCallback<unknown>;
   abortCleanup?: () => void;
 };
-
-type WorkerMessage =
-  | { type: "auth"; epoch: number }
-  | { type: "status"; state: SocketState }
-  | { type: "disconnect"; reason: DisconnectReason }
-  | { type: "event"; event: string; data: unknown; requestID?: bigint }
-  | { type: "text"; text: string }
-  | { type: "identity"; identity: SocketIdentity }
-  | { type: "response"; callID: number; data?: unknown; error?: { code: SocketErrorCode; message: string } }
-  | { type: "error"; error: { code: SocketErrorCode; message: string } }
-  | { type: "progress"; progress: TransferProgress }
-  | { type: "protocol"; event: ProtocolEvent };
-
-type MainMessage =
-  | { type: "configure"; config: ReturnType<typeof normalizeConfig> }
-  | { type: "connect" }
-  | { type: "disconnect" }
-  | { type: "terminate" }
-  | { type: "auth"; epoch: number; token?: string; error?: string }
-  | { type: "emit"; callID: number; event: string; data: unknown }
-  | { type: "respond"; requestID: bigint; event: string; data: unknown }
-  | { type: "cancel"; callID: number };
 
 type Listener<T> = (data: T, respond: EventResponder) => void;
 
@@ -133,6 +112,8 @@ class ETPWorkerSocket<Outgoing extends ClientEvents, Incoming extends ServerEven
       return Promise.reject(error);
     }
     const abortCleanup = signal ? this.bindAbort(callID, signal) : undefined;
+    const payload = preparePayload(data);
+    const transfer = options?.transfer ? payloadTransferables(payload) : undefined;
     if (callback) {
       this.pending.set(callID, {
         resolve: () => undefined,
@@ -140,12 +121,12 @@ class ETPWorkerSocket<Outgoing extends ClientEvents, Incoming extends ServerEven
         callback: callback as EmitCallback<unknown>,
         abortCleanup,
       });
-      this.post({ type: "emit", callID, event, data: preparePayload(data) });
+      this.post({ type: "emit", callID, event, data: payload }, transfer);
       return;
     }
     return new Promise<Outgoing[Event]["response"]>((resolve, reject) => {
       this.pending.set(callID, { resolve: resolve as (data: unknown) => void, reject, abortCleanup });
-      this.post({ type: "emit", callID, event, data: preparePayload(data) });
+      this.post({ type: "emit", callID, event, data: payload }, transfer);
     });
   }
 
@@ -180,28 +161,24 @@ class ETPWorkerSocket<Outgoing extends ClientEvents, Incoming extends ServerEven
   }
 
   onAny(listener: (event: keyof Incoming & string, data: Incoming[keyof Incoming]) => void): () => void {
-    this.anyListeners.add(listener);
-    return () => this.anyListeners.delete(listener);
+    return this.subscribe(this.anyListeners, listener);
   }
 
   onConnect(listener: () => void): () => void {
-    this.connectListeners.add(listener);
-    return () => this.connectListeners.delete(listener);
+    return this.subscribe(this.connectListeners, listener);
   }
 
   onDisconnect(listener: (reason: DisconnectReason) => void): () => void {
-    this.disconnectListeners.add(listener);
-    return () => this.disconnectListeners.delete(listener);
+    return this.subscribe(this.disconnectListeners, listener);
   }
 
   onError(listener: (error: SocketError) => void): () => void {
-    this.errorListeners.add(listener);
-    return () => this.errorListeners.delete(listener);
+    return this.subscribe(this.errorListeners, listener);
   }
 
-  onProgress(listener: (progress: TransferProgress) => void): () => void { this.progressListeners.add(listener); return () => this.progressListeners.delete(listener); }
-  onProtocolEvent(listener: (event: ProtocolEvent) => void): () => void { this.protocolListeners.add(listener); return () => this.protocolListeners.delete(listener); }
-  onText(listener: (text: string) => void): () => void { this.textListeners.add(listener); return () => this.textListeners.delete(listener); }
+  onProgress(listener: (progress: TransferProgress) => void): () => void { return this.subscribe(this.progressListeners, listener); }
+  onProtocolEvent(listener: (event: ProtocolEvent) => void): () => void { return this.subscribe(this.protocolListeners, listener); }
+  onText(listener: (text: string) => void): () => void { return this.subscribe(this.textListeners, listener); }
 
   private handleWorkerMessage(message: WorkerMessage): void {
     switch (message.type) {
@@ -305,8 +282,9 @@ class ETPWorkerSocket<Outgoing extends ClientEvents, Incoming extends ServerEven
     this.pending.clear();
   }
 
-  private post(message: MainMessage): void {
-    this.worker.postMessage(message);
+  private post(message: MainMessage, transfer?: Transferable[]): void {
+    if (transfer?.length) this.worker.postMessage(message, transfer);
+    else this.worker.postMessage(message);
   }
 
   private bindAbort(callID: number, signal: AbortSignal): () => void {
@@ -319,6 +297,11 @@ class ETPWorkerSocket<Outgoing extends ClientEvents, Incoming extends ServerEven
     if (this.terminated) {
       throw new SocketError("terminated", "socket is closed");
     }
+  }
+
+  private subscribe<T>(listeners: Set<T>, listener: T): () => void {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
   }
 
   private callListeners<T>(listeners: Iterable<(value: T) => void>, value?: T): void {
@@ -340,7 +323,7 @@ class ETPWorkerSocket<Outgoing extends ClientEvents, Incoming extends ServerEven
   }
 }
 
-function normalizeConfig(options: SocketOptions) {
+function normalizeConfig(options: SocketOptions): WorkerConfig {
   const input = options.reconnection;
   const reconnection =
     input === false
@@ -366,9 +349,10 @@ function normalizeConfig(options: SocketOptions) {
       heartbeatTimeout: options.protocol?.heartbeatTimeout ?? 20_000,
       ackTimeout: options.protocol?.ackTimeout ?? 2_000,
       retryLimit: options.protocol?.retryLimit ?? 3,
+      maxRequestsPerSecond: options.protocol?.maxRequestsPerSecond ?? 200,
       maxFramesPerSecond: options.protocol?.maxFramesPerSecond ?? 2_000,
       maxBytesPerSecond: options.protocol?.maxBytesPerSecond ?? 64 << 20,
-      checksum: options.protocol?.checksum ?? true,
+      checksum: options.protocol?.checksum ?? false,
       resumeToken: options.protocol?.resumeToken ?? new Uint8Array(),
     },
   };
@@ -379,9 +363,9 @@ export function io<Outgoing extends ClientEvents, Incoming extends ServerEvents>
 }
 
 function preparePayload(data: unknown): unknown {
-  const fields: Array<{ key: string; value: string }> = [], parts: Array<{ field: string; index: number; name: string; blob: Blob }> = [];
+  const fields: Array<{ key: string; value: string }> = [], parts: Array<{ field: string; index: number; name: string; blob: Blob | ArrayBuffer | Uint8Array }> = [];
   const append = (field: string, value: unknown, index: number) => {
-    if (value instanceof Blob) parts.push({ field, index, name: typeof File !== "undefined" && value instanceof File ? value.name : "", blob: value });
+    if (isBinaryPart(value)) parts.push({ field, index, name: typeof File !== "undefined" && value instanceof File ? value.name : "", blob: value });
     else fields.push({ key: field, value: typeof value === "string" ? value : JSON.stringify(value) });
   };
   if (typeof FormData !== "undefined" && data instanceof FormData) {
@@ -389,12 +373,28 @@ function preparePayload(data: unknown): unknown {
     for (const [field, value] of data.entries()) { const index = indices.get(field) ?? 0; append(field, value, index); indices.set(field, index + 1); }
   } else if (data && typeof data === "object" && !(data instanceof Blob) && !(data instanceof ArrayBuffer) && !(data instanceof Uint8Array)) {
     for (const [field, value] of Object.entries(data)) {
-      if (Array.isArray(value) && value.some((entry) => entry instanceof Blob)) value.forEach((entry, index) => append(field, entry, index));
-      else if (value instanceof Blob) append(field, value, 0);
+      if (Array.isArray(value) && value.some(isBinaryPart)) value.forEach((entry, index) => append(field, entry, index));
+      else if (isBinaryPart(value)) append(field, value, 0);
       else append(field, value, 0);
     }
   }
   return parts.length ? { __etpMultipart: true, fields, parts } : data;
+}
+
+function isBinaryPart(value: unknown): value is Blob | ArrayBuffer | Uint8Array {
+  return value instanceof Blob || value instanceof ArrayBuffer || value instanceof Uint8Array;
+}
+
+function payloadTransferables(data: unknown): Transferable[] {
+  const buffers = new Set<ArrayBuffer>();
+  const add = (value: unknown) => {
+    if (value instanceof ArrayBuffer) buffers.add(value);
+    else if (value instanceof Uint8Array && value.buffer instanceof ArrayBuffer) buffers.add(value.buffer);
+  };
+  if (data && typeof data === "object" && "__etpMultipart" in data) {
+    for (const part of (data as unknown as { parts: Array<{ blob: unknown }> }).parts) add(part.blob);
+  } else add(data);
+  return [...buffers];
 }
 
 export { SocketError, SocketState };

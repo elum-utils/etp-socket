@@ -1,0 +1,79 @@
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: npm-publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out package
+        uses: actions/checkout@v6
+        with:
+          path: etp-socket
+
+      - name: Check out Go reference implementation
+        uses: actions/checkout@v6
+        with:
+          repository: elum-utils/go-etp
+          path: go-etp
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: etp-socket/integration/go-server/go.mod
+          cache-dependency-path: |
+            etp-socket/integration/go-server/go.sum
+            go-etp/go.sum
+
+      - name: Verify release version
+        working-directory: etp-socket
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+
+          const manifest = JSON.parse(readFileSync("package.json", "utf8"));
+          const expected = `v${manifest.version}`;
+          if (process.env.RELEASE_TAG !== expected) {
+            throw new Error(`release tag ${process.env.RELEASE_TAG} must equal ${expected}`);
+          }
+          NODE
+
+      - name: Install dependencies
+        working-directory: etp-socket
+        run: npm ci
+
+      - name: Validate package
+        working-directory: etp-socket
+        run: |
+          npm run check
+          npm test
+          npm run test:go
+          npm run build
+          npm pack --dry-run
+
+      - name: Publish package
+        working-directory: etp-socket
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
