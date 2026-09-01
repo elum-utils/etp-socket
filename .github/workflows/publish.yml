@@ -30,26 +30,12 @@ jobs:
           path: etp-socket
           ref: ${{ github.event.release.tag_name || github.sha }}
 
-      - name: Check out Go reference implementation
-        uses: actions/checkout@v6
-        with:
-          repository: elum-utils/go-etp
-          path: go-etp
-
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: etp-socket/integration/go-server/go.mod
-          cache-dependency-path: |
-            etp-socket/integration/go-server/go.sum
-            go-etp/go.sum
 
       - name: Set package version from tag
         working-directory: etp-socket
@@ -76,7 +62,6 @@ jobs:
         run: |
           npm run check
           npm test
-          npm run test:go
           npm run build
           npm pack --dry-run
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"net/http"
 
@@ -82,7 +83,16 @@ func clientConfirmed(ctx *etp.Context) error {
 
 func echo(ctx *etp.Context) error {
 	log.Printf("echo event=%q request=%d transfer=%d bytes=%d", ctx.Event, ctx.RequestID, ctx.TransferID, ctx.Body.Size())
-	handle, err := ctx.Respond(etp.SendOptions{Event: "echo", Body: ctx.Body})
+	reader, err := ctx.Body.Open()
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	handle, err := ctx.Respond(etp.SendOptions{Event: "echo", Data: data})
 	if err == nil && handle.TransferID != 0 {
 		go func() { log.Printf("response transfer=%d done: %v", handle.TransferID, <-handle.Done()) }()
 	}

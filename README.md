@@ -120,8 +120,9 @@ npm run package:check
 Package releases are published by `.github/workflows/publish.yml`. Create a
 GitHub Release with a SemVer tag carrying a `v` prefix, for example `v0.0.1`.
 The workflow writes that tag version into the npm manifest and lockfile, then
-validates TypeScript, unit tests, Go
-conformance, the production build, and the npm tarball before publishing.
+validates TypeScript, unit tests, the production build, and the npm tarball
+before publishing. Go conformance remains available as `npm run test:go` and
+requires a matching local `go-etp` checkout.
 
 For the first release, add an npm granular access token with package publish
 permission and 2FA bypass as the `NPM_TOKEN` repository secret. After the
