@@ -78,6 +78,6 @@ jobs:
             echo "$PACKAGE_NAME is already published; updating its visibility"
           fi
           rm -f "$PUBLISH_LOG"
-          npm access set status public "$PACKAGE_NAME"
+          npm access set status=public "$PACKAGE_NAME"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
