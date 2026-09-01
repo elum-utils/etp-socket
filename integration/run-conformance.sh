@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$(mktemp)"
+BINARY="$(mktemp -d)/etp-conformance-server"
 
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]]; then
@@ -10,10 +11,13 @@ cleanup() {
     wait "$SERVER_PID" 2>/dev/null || true
   fi
   rm -f "$LOG"
+  rm -f "$BINARY"
+  rmdir "$(dirname "$BINARY")" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-(cd "$ROOT/integration/go-server" && go run . -addr 127.0.0.1:18991) >"$LOG" 2>&1 &
+(cd "$ROOT/integration/go-server" && go build -o "$BINARY" .)
+"$BINARY" -addr 127.0.0.1:18991 >"$LOG" 2>&1 &
 SERVER_PID=$!
 
 for _ in {1..100}; do
