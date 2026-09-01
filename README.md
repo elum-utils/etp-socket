@@ -1,0 +1,96 @@
+# @elum/etp-socket
+
+Browser ETP client with a Socket.IO-like API. WebSocket, ETP handshake,
+authentication, reconnect, heartbeat and request timeouts run inside a dedicated
+Web Worker. The application only receives typed events and request results.
+
+```ts
+import { io } from "@elum/etp-socket";
+
+type ClientEvents = {
+  "message.send": {
+    request: { dialog: string; text: string };
+    response: { id: string };
+  };
+};
+
+type ServerEvents = {
+  "message.new": { id: string; text: string };
+};
+
+const socket = io<ClientEvents, ServerEvents>({
+  url: "wss://api.example.com/ws",
+  auth: () => sessionStorage.getItem("token") ?? "",
+  timeout: 10_000,
+  reconnection: true,
+});
+
+socket.on("message.new", (message) => console.log(message));
+
+const created = await socket.emit("message.send", {
+  dialog: "dialog-id",
+  text: "Hello",
+});
+
+socket.emit("message.send", { dialog: "dialog-id", text: "Hello" }, (error, response) => {
+  if (error) return;
+  console.log(response?.id);
+});
+```
+
+`emit` creates an ETP request and resolves only a response carrying the same
+request ID. The timeout is enforced inside the Worker. `disconnect()` keeps the
+Worker for a later `connect()`, while `close()` terminates it and rejects pending
+requests.
+
+Server requests use the same event API and an acknowledgment callback:
+
+```ts
+socket.on("client.confirm", (request, respond) => {
+  respond({ accepted: true });
+});
+```
+
+`File`, `Blob`, `FormData`, arrays of files, and objects containing files are
+automatically sent as ETP multipart transfers. Small JSON stays inline; large
+JSON automatically switches to chunked transfer without changing the API.
+
+```ts
+await socket.emit("attach.upload", {
+  dialog: "dialog-id",
+  files: [fileA, fileB],
+});
+```
+
+The client supports authentication identity, capability negotiation, request and
+response correlation, ACK/NACK retry, receiver windows, SHA-256 verification,
+cancellation, transfer progress, reconnect resume, heartbeat, protocol errors,
+text frames, and graceful drain/close. Protocol limits are configurable:
+
+```ts
+const socket = io<ClientEvents, ServerEvents>({
+  url: "wss://api.example.com/ws",
+  auth: getToken,
+  protocol: {
+    chunkSize: 16 << 10,
+    maxTransferBytes: 64 << 20,
+    maxConcurrentTransfers: 16,
+    maxInFlightChunks: 16,
+    heartbeatInterval: 10_000,
+    heartbeatTimeout: 20_000,
+    ackTimeout: 2_000,
+    retryLimit: 3,
+    checksum: true,
+  },
+});
+```
+
+## Checks
+
+```bash
+npm run check
+npm test
+npm run test:coverage
+npm run test:go
+npm run build
+```

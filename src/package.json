@@ -1,0 +1,19 @@
+{
+  "name": "@elum/etp-socket",
+  "version": "0.1.0",
+  "description": "Socket.IO-like browser client for Elum Transport Protocol",
+  "main": "index.cjs",
+  "module": "index.js",
+  "types": "index.d.ts",
+  "browser": {
+    "./index.cjs": "./index.cjs",
+    "./index.js": "./index.js"
+  },
+  "unpkg": "index.cjs",
+  "type": "module",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GMELUM/etp-socket"
+  }
+}
