@@ -77,6 +77,17 @@ describe("public socket API", () => {
     await expect(result).resolves.toEqual({ id: "message-1" });
   });
 
+  it("connects with an empty auth token when no auth provider is configured", async () => {
+    const socket = io<Outgoing, Incoming>({ url: "wss://example.test/ws", autoConnect: false });
+    const worker = latestWorker();
+
+    socket.connect();
+    worker.deliver({ type: "auth", epoch: 4 });
+    await Promise.resolve();
+
+    expect(worker.messages).toContainEqual({ type: "auth", epoch: 4, token: "" });
+  });
+
   it("supports callback emits and converts worker errors to SocketError", () => {
     const socket = io<Outgoing, Incoming>({ url: "wss://example.test/ws", auth: () => "token", autoConnect: false });
     const worker = latestWorker();

@@ -170,12 +170,12 @@ scope.onmessage = ({ data }: MessageEvent<MainMessage>) => {
       if (data.epoch !== authEpoch || !desiredConnection || terminated) {
         return;
       }
-      if (data.error || !data.token) {
-        emitError("auth", data.error ?? "authentication token is empty");
+      if (data.error) {
+        emitError("auth", data.error);
         scheduleReconnect();
         return;
       }
-      openSocket(data.token);
+      openSocket(data.token ?? "");
       return;
     case "emit":
       void sendRequest(data.callID, data.event, data.data);
@@ -869,6 +869,8 @@ function clearReconnectTimer(): void {
 function startHeartbeat(): void {
   stopHeartbeat();
   heartbeat = setInterval(() => {
+    // A suspended browser can run this timer before its queued close event.
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
     monitorOutgoingTransfers();
     if ((phase === "open" || phase === "draining") && Date.now() - lastReadAt > (config?.protocol.heartbeatTimeout ?? 20_000)) {
       emitError("timeout", "ETP heartbeat timed out");

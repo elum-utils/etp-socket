@@ -123,6 +123,16 @@ describe("ETP socket worker", () => {
     expect(output).toContainEqual({ type: "response", callID: 7, data: { id: "message-1" }, error: undefined });
   });
 
+  it("opens a connection with an empty auth token", () => {
+    connect();
+    const authRequest = output.find((message) => message.type === "auth") as { epoch: number };
+    dispatch({ type: "auth", epoch: authRequest.epoch, token: "" });
+
+    const connection = latestSocket();
+    connection.open();
+    expect(decodeFrame(connection.sent[0]).type).toBe(FrameType.Auth);
+  });
+
   it("delivers a server request and sends its callback response with the same request id", () => {
     const connection = openConnection();
     connection.receive(encodeRequest(77n, "client.confirm", { value: 1 }, [{ key: "attempt", value: "2" }]));
@@ -574,6 +584,22 @@ describe("ETP socket worker", () => {
     vi.advanceTimersByTime(21_000);
     expect(output).toContainEqual({ type: "error", error: { code: "timeout", message: "ETP heartbeat timed out" } });
     expect(connection.readyState).toBe(FakeWebSocket.CLOSED);
+  });
+
+  it("does not retry a transfer into a closed socket before its close event runs", async () => {
+    const connection = openConnection(0x37ffn, 20_000);
+    dispatch({ type: "emit", callID: 35, event: "upload", data: new Uint8Array(16 << 10) });
+    await vi.waitFor(() => expect(connection.sent.some((item) => decodeFrame(item).type === FrameType.TransferBegin)).toBe(true));
+    const begin = connection.sent.map(decodeFrame).find((frame) => frame.type === FrameType.TransferBegin)!;
+    connection.receive(encodeWindow({ transferID: begin.transferID, windowBytes: 16n << 10n, windowChunks: 1, flags: WindowFlag.Transfer }));
+    await vi.advanceTimersByTimeAsync(1);
+    const sent = connection.sent.length;
+
+    // Browsers can report CLOSED before dispatching onclose after a long pause.
+    connection.readyState = FakeWebSocket.CLOSED;
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(connection.sent).toHaveLength(sent);
+    connection.onclose?.();
   });
 
   it("retries unacknowledged chunks and fails at the configured retry limit", async () => {

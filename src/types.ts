@@ -62,7 +62,7 @@ export type ProtocolOptions = {
 
 export type SocketOptions = {
   url: string;
-  auth: () => string | Promise<string>;
+  auth?: () => string | Promise<string>;
   autoConnect?: boolean;
   reconnection?: boolean | ReconnectionOptions;
   timeout?: number;

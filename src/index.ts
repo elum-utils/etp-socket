@@ -222,7 +222,7 @@ class ETPWorkerSocket<Outgoing extends ClientEvents, Incoming extends ServerEven
 
   private async sendAuth(epoch: number): Promise<void> {
     try {
-      const token = await this.options.auth();
+      const token = await this.options.auth?.() ?? "";
       this.post({ type: "auth", epoch, token });
     } catch (error) {
       this.post({
