@@ -1,6 +1,6 @@
 {
   "name": "@elum/etp-socket",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Socket.IO-like browser client for Elum Transport Protocol",
   "license": "MIT",
   "type": "module",

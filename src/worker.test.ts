@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { decodeCancelAck, decodeEvent, decodeFrame, decodeTransferResume, decodeTransferState, encodeAck, encodeCancel, encodeClose, encodeData, encodeGoAway, encodeNack, encodeRequest, encodeTransferBegin, encodeTransferEnd, encodeTransferResume, encodeTransferState, encodeWindow, CloseFlag, FrameFlag, FrameType, HeaderSize, Schema, TransferFlag, TransferStateFlag, WindowFlag } from "./protocol";
-import { SocketState } from "./types";
+import { SocketState, type WorkerConfig } from "./types";
 
 type WorkerOutput = Record<string, unknown>;
 
@@ -217,17 +217,326 @@ describe("ETP socket worker", () => {
     });
   });
 
-  it("rejects an emit before the ETP handshake is established", () => {
+  it("queues before authentication and hello, then resolves the original call", async () => {
     connect();
-    dispatch({ type: "emit", callID: 9, event: "message.send", data: {} });
-
-    expect(output).toContainEqual({
-      type: "response",
-      callID: 9,
-      data: undefined,
-      error: { code: "closed", message: "socket is not connected" },
-    });
+    dispatch({ type: "emit", callID: 9, event: "echo", data: { n: 9 } });
+    expect(responses(9)).toEqual([]);
+    expect(output.filter(message => message.type === "auth")).toHaveLength(1);
+    const auth = latestAuth();
+    dispatch({ type: "auth", epoch: auth.epoch, token: "token" });
+    const connection = latestSocket();
+    connection.open();
+    connection.receive(serverAuthAccept("account-1"));
+    expect(requests(connection)).toEqual([]);
+    connection.receive(serverHello("server"));
+    await Promise.resolve();
+    const request = requests(connection)[0];
+    expect(decodeEvent(request).data).toEqual({ n: 9 });
+    connection.receive(serverResponse(request.requestID, "echo", { ok: true }));
+    expect(responses(9)).toEqual([{ type: "response", callID: 9, data: { ok: true }, error: undefined }]);
   });
+
+  it("retains offline requests beyond the response timeout and starts the timeout on dispatch", async () => {
+    connect(500);
+    dispatch({ type: "emit", callID: 10, event: "echo", data: {} });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(responses(10)).toEqual([]);
+    await vi.advanceTimersToNextTimerAsync();
+    const connection = authenticate();
+    await vi.advanceTimersByTimeAsync(499);
+    expect(requests(connection)).toHaveLength(1);
+    expect(responses(10)).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(responses(10)).toEqual([expect.objectContaining({ error: { code: "timeout", message: "request timed out" } })]);
+  });
+
+  it("flushes multiple queued calls once in insertion order", async () => {
+    connect();
+    for (let n = 1; n <= 6; n++) dispatch({ type: "emit", callID: n, event: "echo", data: { n } });
+    expect(output.filter(message => message.type === "auth")).toHaveLength(1);
+    const connection = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(connection).map(frame => decodeEvent(frame).data)).toEqual([1,2,3,4,5,6].map(n => ({ n })));
+    expect(new Set(requests(connection).map(frame => frame.requestID)).size).toBe(6);
+  });
+
+  it("queues a call after network loss and sends it on a fresh authenticated connection", async () => {
+    const first = openConnection();
+    first.close();
+    dispatch({ type: "emit", callID: 11, event: "echo", data: { n: 11 } });
+    expect(responses(11)).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const second = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(first)).toEqual([]);
+    expect(requests(second)).toHaveLength(1);
+    second.receive(serverResponse(requests(second)[0].requestID, "echo", { ok: true }));
+    expect(responses(11)).toHaveLength(1);
+  });
+
+  it("recovers a CLOSED transport before its queued close event arrives", async () => {
+    const first = openConnection();
+    first.readyState = FakeWebSocket.CLOSED;
+    dispatch({ type: "emit", callID: 12, event: "echo", data: {} });
+    first.onclose?.();
+    expect(responses(12)).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const second = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(second)).toHaveLength(1);
+    expect(output.filter(message => message.type === "auth")).toHaveLength(2);
+  });
+
+  it("requeues rate-limited unsent frames ahead of newer calls without replaying a sent mutation", async () => {
+    const limits = { requests: 1, requestBurst: 1, frames: 100, frameBurst: 100, bytes: 1n << 20n, byteBurst: 1n << 20n };
+    const first = openConnection(0x37ffn, 10_000, limits);
+    for (let n = 1; n <= 3; n++) dispatch({ type: "emit", callID: n, event: "mutate", data: { n } });
+    expect(requests(first)).toHaveLength(1);
+    first.close();
+    dispatch({ type: "emit", callID: 4, event: "mutate", data: { n: 4 } });
+    expect(responses(1)).toEqual([expect.objectContaining({ error: { code: "closed", message: "connection closed before a response was received" } })]);
+    expect(responses(2)).toEqual([]);
+    expect(responses(3)).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const second = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(second).map(frame => decodeEvent(frame).data)).toEqual([{ n: 2 }, { n: 3 }, { n: 4 }]);
+    expect(responses(1)).toHaveLength(1);
+  });
+
+  it("cancels an offline call and releases its queue capacity", async () => {
+    connect(10_000, 200, { maxQueuedRequests: 1 });
+    dispatch({ type: "emit", callID: 20, event: "echo", data: { n: 20 } });
+    dispatch({ type: "cancel", callID: 20 });
+    dispatch({ type: "emit", callID: 21, event: "echo", data: { n: 21 } });
+    const connection = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(responses(20)).toEqual([expect.objectContaining({ error: { code: "closed", message: "request was canceled" } })]);
+    expect(responses(21)).toEqual([]);
+    expect(requests(connection).map(frame => decodeEvent(frame).data)).toEqual([{ n: 21 }]);
+  });
+
+  it("cancels an inline request waiting for rate quota without sending it later", async () => {
+    const limits = { requests: 1, requestBurst: 1, frames: 100, frameBurst: 100, bytes: 1n << 20n, byteBurst: 1n << 20n };
+    const connection = openConnection(0x37ffn, 10_000, limits);
+    dispatch({ type: "emit", callID: 22, event: "echo", data: { n: 22 } });
+    dispatch({ type: "emit", callID: 23, event: "echo", data: { n: 23 } });
+    dispatch({ type: "cancel", callID: 23 });
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(requests(connection)).toHaveLength(1);
+    expect(responses(23)).toHaveLength(1);
+  });
+
+  it.each([
+    { limits: { maxQueuedRequests: 1 }, second: {} },
+    { limits: { maxQueuedBytes: 30 }, second: { text: "x".repeat(40) } },
+  ])("bounds the offline queue without losing its accepted call ($limits)", async ({ limits, second }) => {
+    connect(10_000, 200, limits);
+    dispatch({ type: "emit", callID: 24, event: "echo", data: {} });
+    dispatch({ type: "emit", callID: 25, event: "echo", data: second });
+    expect(responses(24)).toEqual([]);
+    expect(responses(25)).toEqual([expect.objectContaining({ error: { code: "protocol", message: "outgoing request queue limit exceeded" } })]);
+    const connection = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(connection)).toHaveLength(1);
+  });
+
+  it.each(["server", "provider"])("fails all queued and future calls on %s authentication rejection", async mode => {
+    connect();
+    for (const callID of [30, 31]) dispatch({ type: "emit", callID, event: "echo", data: {} });
+    if (mode === "provider") dispatch({ type: "auth", epoch: latestAuth().epoch, error: "invalid token" });
+    else {
+      dispatch({ type: "auth", epoch: latestAuth().epoch, token: "token" });
+      latestSocket().open();
+      latestSocket().receive(serverAuthReject("invalid token"));
+    }
+    dispatch({ type: "emit", callID: 32, event: "echo", data: {} });
+    await vi.advanceTimersByTimeAsync(60_000);
+    for (const callID of [30,31,32]) expect(responses(callID)).toEqual([expect.objectContaining({ error: { code: "auth", message: "invalid token" } })]);
+    expect(output.filter(message => message.type === "status").at(-1)).toEqual({ type: "status", state: SocketState.Unauthorized });
+    expect(output.filter(message => message.type === "auth")).toHaveLength(1);
+  });
+
+  it("rejects queued work on fatal protocol failure and permits an explicit new connection", async () => {
+    connect();
+    dispatch({ type: "emit", callID: 33, event: "echo", data: {} });
+    dispatch({ type: "auth", epoch: latestAuth().epoch, token: "token" });
+    const first = latestSocket();
+    first.open(); first.receive(serverAuthAccept("account-1")); first.receive(serverHello("client"));
+    expect(responses(33)[0]).toMatchObject({ error: { code: "protocol" } });
+    dispatch({ type: "connect" });
+    dispatch({ type: "emit", callID: 34, event: "echo", data: {} });
+    const second = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(second)).toHaveLength(1);
+    expect(responses(34)).toEqual([]);
+  });
+
+  it.each(["disconnect", "terminate"])("settles queued calls exactly once on %s", async type => {
+    connect();
+    const epoch = latestAuth().epoch;
+    for (const callID of [35,36]) dispatch({ type: "emit", callID, event: "echo", data: {} });
+    dispatch({ type });
+    dispatch({ type: "auth", epoch, token: "stale-token" });
+    await vi.advanceTimersByTimeAsync(60_000);
+    for (const callID of [35,36]) expect(responses(callID)).toEqual([expect.objectContaining({ error: expect.objectContaining({ code: type === "terminate" ? "terminated" : "closed" }) })]);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("holds later calls after manual disconnect until connect is requested", async () => {
+    connect(); dispatch({ type: "disconnect" });
+    dispatch({ type: "emit", callID: 37, event: "echo", data: {} });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(responses(37)).toEqual([]);
+    dispatch({ type: "connect" });
+    const connection = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(connection)).toHaveLength(1);
+  });
+
+  it("respects reconnection disabled and flushes new offline calls only after manual connect", async () => {
+    connect(10_000, 200, { reconnection: { enabled: false, attempts: 0, delay: 1_000, maxDelay: 10_000 } });
+    const first = authenticate();
+    first.close();
+    dispatch({ type: "emit", callID: 38, event: "echo", data: {} });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(output.filter(message => message.type === "auth")).toHaveLength(1);
+    dispatch({ type: "connect" });
+    const second = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(second)).toHaveLength(1);
+  });
+
+  it("settles queued requests when an explicit finite reconnect budget is exhausted", async () => {
+    connect(10_000, 200, { reconnection: { enabled: true, attempts: 1, delay: 1_000, maxDelay: 10_000 } });
+    dispatch({ type: "emit", callID: 39, event: "echo", data: {} });
+    dispatch({ type: "auth", epoch: latestAuth().epoch, token: "token" }); latestSocket().close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    dispatch({ type: "auth", epoch: latestAuth().epoch, token: "token" }); latestSocket().close();
+    dispatch({ type: "emit", callID: 40, event: "echo", data: {} });
+    for (const callID of [39,40]) expect(responses(callID)).toEqual([expect.objectContaining({ error: { code: "connection", message: "reconnection attempts exhausted" } })]);
+  });
+
+  it("keeps requests queued through more than five retries when attempts are unlimited", async () => {
+    connect(10_000, 200, { reconnection: { enabled: true, attempts: Infinity, delay: 1_000, maxDelay: 10_000 } });
+    dispatch({ type: "emit", callID: 41, event: "echo", data: {} });
+    for (let attempt = 0; attempt < 8; attempt++) {
+      dispatch({ type: "auth", epoch: latestAuth().epoch, token: "token" }); latestSocket().close();
+      await vi.advanceTimersByTimeAsync(Math.min(1_000 * 2 ** attempt, 10_000));
+      expect(responses(41)).toEqual([]);
+    }
+    const connection = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(connection)).toHaveLength(1);
+  });
+
+  it.each(["auth", "tcp"])("recovers a stalled %s stage and ignores an obsolete auth reply", async stage => {
+    connect(100);
+    const oldEpoch = latestAuth().epoch;
+    dispatch({ type: "emit", callID: 42, event: "echo", data: {} });
+    if (stage === "tcp") dispatch({ type: "auth", epoch: oldEpoch, token: "token" });
+    await vi.advanceTimersByTimeAsync(1_100);
+    const epoch = latestAuth().epoch;
+    expect(epoch).not.toBe(oldEpoch);
+    const before = FakeWebSocket.instances.length;
+    dispatch({ type: "auth", epoch: oldEpoch, token: "obsolete" });
+    expect(FakeWebSocket.instances).toHaveLength(before);
+    const connection = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(connection)).toHaveLength(1);
+    expect(responses(42)).toEqual([]);
+  });
+
+  it("requeues a Blob whose preparation was interrupted without duplicate completion", async () => {
+    const first = openConnection();
+    const blob = new Blob([new Uint8Array([1,2,3])]);
+    let finishRead!: (bytes: ArrayBuffer) => void;
+    vi.spyOn(blob, "arrayBuffer").mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; }));
+    dispatch({ type: "emit", callID: 43, event: "upload", data: blob });
+    first.close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const second = authenticate();
+    await vi.waitFor(() => expect(second.sent.map(decodeFrame).filter(frame => frame.type === FrameType.TransferBegin)).toHaveLength(1));
+    finishRead(new Uint8Array([1,2,3]).buffer);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(first.sent.map(decodeFrame).filter(frame => frame.type === FrameType.TransferBegin)).toHaveLength(0);
+    expect(second.sent.map(decodeFrame).filter(frame => frame.type === FrameType.TransferBegin)).toHaveLength(1);
+    expect(responses(43)).toEqual([]);
+  });
+
+  it("does not let an old graceful-close timer or error affect the replacement connection", async () => {
+    const first = openConnection();
+    dispatch({ type: "disconnect" }); first.close(); dispatch({ type: "connect" });
+    const second = authenticate();
+    const before = output.length;
+    first.onerror?.();
+    expect(output).toHaveLength(before);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(second.readyState).toBe(FakeWebSocket.OPEN);
+  });
+
+  it("ignores late messages during graceful close and keeps new calls for the next connection", async () => {
+    const first = openConnection();
+    dispatch({ type: "disconnect" });
+    dispatch({ type: "emit", callID: 44, event: "echo", data: { n: 44 } });
+    first.receive(encodeRequest(9999n, "late.event", {}));
+    first.receive(serverResponse(8888n, "late.response", {}));
+    expect(output.filter(message => message.type === "error" && (message.error as { code: string }).code === "protocol")).toEqual([]);
+    expect(output.filter(message => message.type === "event" && message.event === "late.event")).toEqual([]);
+    first.close();
+    expect(responses(44)).toEqual([]);
+    dispatch({ type: "connect" });
+    const second = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(second).map(frame => decodeEvent(frame).data)).toEqual([{ n: 44 }]);
+  });
+
+  it.each([
+    new Blob([new Uint8Array(128)]),
+    new ArrayBuffer(128),
+    new Uint8Array(128),
+    { __etpMultipart: true, fields: [], parts: [{ field: "file", index: 0, name: "x.bin", blob: new Uint8Array(128) }] },
+  ])("bounds queued binary and multipart payloads before reading or sending them", async data => {
+    connect(10_000, 200, { maxQueuedBytes: 100 });
+    dispatch({ type: "emit", callID: 50, event: "upload", data });
+    expect(responses(50)).toEqual([expect.objectContaining({ error: { code: "protocol", message: "outgoing request queue limit exceeded" } })]);
+    dispatch({ type: "emit", callID: 51, event: "echo", data: {} });
+    const connection = authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(connection)).toHaveLength(1);
+    expect(connection.sent.map(decodeFrame).filter(frame => frame.type === FrameType.TransferBegin)).toEqual([]);
+  });
+
+  it.each(["offline", "open"])("rejects malformed payloads once without blocking subsequent %s requests", async state => {
+    const connection = state === "open" ? openConnection() : (connect(), undefined);
+    const cyclic: { self?: unknown } = {}; cyclic.self = cyclic;
+    dispatch({ type: "emit", callID: 52, event: "echo", data: cyclic });
+    expect(responses(52)).toHaveLength(1);
+    expect(responses(52)[0]).toMatchObject({ error: { code: "protocol" } });
+    dispatch({ type: "emit", callID: 53, event: "echo", data: { ok: true } });
+    const active = connection ?? authenticate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests(active).map(frame => decodeEvent(frame).data)).toEqual([{ ok: true }]);
+  });
+
+  function latestAuth(): { epoch: number } {
+    return output.filter(message => message.type === "auth").at(-1) as { epoch: number };
+  }
+
+  function authenticate(): FakeWebSocket {
+    dispatch({ type: "auth", epoch: latestAuth().epoch, token: "fresh-token" });
+    const connection = latestSocket();
+    connection.open(); connection.receive(serverAuthAccept("account-1")); connection.receive(serverHello("server"));
+    return connection;
+  }
+
+  function requests(connection: FakeWebSocket) {
+    return connection.sent.map(decodeFrame).filter(frame => frame.type === FrameType.Request);
+  }
+
+  function responses(callID: number) {
+    return output.filter(message => message.type === "response" && message.callID === callID);
+  }
 
   it("reconnects after a network close and requests a fresh auth token", () => {
     const connection = openConnection();
@@ -649,7 +958,7 @@ describe("ETP socket worker", () => {
     expect(connection.readyState).toBe(FakeWebSocket.CLOSED);
   });
 
-  function connect(timeout = 10_000, maxRequestsPerSecond = 200): void {
+  function connect(timeout = 10_000, maxRequestsPerSecond = 200, overrides: Partial<WorkerConfig> = {}): void {
     dispatch({
       type: "configure",
       config: {
@@ -657,6 +966,7 @@ describe("ETP socket worker", () => {
         timeout,
         reconnection: { enabled: true, attempts: 5, delay: 1_000, maxDelay: 10_000 },
         protocol: { chunkSize: 16 << 10, maxTransferBytes: 64 << 20, maxConcurrentTransfers: 16, maxInFlightChunks: 16, heartbeatInterval: 10_000, heartbeatTimeout: 20_000, ackTimeout: 2_000, retryLimit: 3, maxRequestsPerSecond, maxFramesPerSecond: 2_000, maxBytesPerSecond: 64 << 20, checksum: true, resumeToken: new Uint8Array() },
+        ...overrides,
       },
     });
     dispatch({ type: "connect" });

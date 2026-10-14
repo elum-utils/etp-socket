@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     coverage: {
       provider: "v8",
+      include: ["src/**/*.ts"],
       exclude: ["config/**", "dist/**", "**/*.d.ts", "vitest.config.ts"],
       thresholds: {
         statements: 85,

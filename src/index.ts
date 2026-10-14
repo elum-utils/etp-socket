@@ -30,7 +30,7 @@ type Listener<T> = (data: T, respond: EventResponder) => void;
 
 const defaultReconnection: Required<ReconnectionOptions> = {
   enabled: true,
-  attempts: 5,
+  attempts: Infinity,
   delay: 1_000,
   maxDelay: 10_000,
 };
@@ -340,6 +340,8 @@ function normalizeConfig(options: SocketOptions): WorkerConfig {
     url: options.url,
     timeout: options.timeout ?? 10_000,
     reconnection,
+    maxQueuedRequests: options.maxQueuedRequests ?? 256,
+    maxQueuedBytes: options.maxQueuedBytes ?? 64 << 20,
     protocol: {
       chunkSize: options.protocol?.chunkSize ?? 16 << 10,
       maxTransferBytes: options.protocol?.maxTransferBytes ?? 64 << 20,

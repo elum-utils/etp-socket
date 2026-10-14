@@ -51,6 +51,53 @@ suite("Go ETP conformance", () => {
     expect(multipart.data).toEqual({ ok: true });
   }, 20_000);
 
+  it("keeps requests made while offline and flushes them after a real Go handshake", async () => {
+    const start = output.length;
+    dispatch({ type: "disconnect" });
+    await waitFor(() => output.slice(start).find(message => message.type === "status" && message.state === SocketState.Closed));
+    for (const callID of [101, 102]) dispatch({ type: "emit", callID, event: "echo", data: { callID } });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(output.filter(message => message.type === "response" && [101,102].includes(message.callID as number))).toEqual([]);
+    await reconnect(start, "integration-token");
+    for (const callID of [101,102]) {
+      const response = await waitFor(() => output.find(message => message.type === "response" && message.callID === callID));
+      expect(response).toMatchObject({ data: { callID }, error: undefined });
+      expect(output.filter(message => message.type === "response" && message.callID === callID)).toHaveLength(1);
+    }
+  });
+
+  it("rejects an offline queue on real Go auth failure and supports a fresh explicit login", async () => {
+    const start = output.length;
+    dispatch({ type: "disconnect" });
+    await waitFor(() => output.slice(start).find(message => message.type === "status" && message.state === SocketState.Closed));
+    for (const callID of [103,104]) dispatch({ type: "emit", callID, event: "echo", data: {} });
+    dispatch({ type: "connect" });
+    const auth = await waitFor(() => output.slice(start).find(message => message.type === "auth")) as { epoch: number };
+    dispatch({ type: "auth", epoch: auth.epoch, token: "invalid-token" });
+    await waitFor(() => output.slice(start).find(message => message.type === "disconnect" && message.reason === "auth"));
+    dispatch({ type: "emit", callID: 105, event: "echo", data: {} });
+    for (const callID of [103,104,105]) {
+      const response = await waitFor(() => output.find(message => message.type === "response" && message.callID === callID));
+      expect(response, JSON.stringify(output.slice(start), (_, value) => typeof value === "bigint" ? value.toString() : value)).toMatchObject({ error: { code: "auth", message: "invalid integration token" } });
+      expect(output.filter(message => message.type === "response" && message.callID === callID)).toHaveLength(1);
+    }
+    const resumed = output.length;
+    dispatch({ type: "connect" });
+    dispatch({ type: "emit", callID: 106, event: "echo", data: { restored: true } });
+    await reconnect(resumed, "integration-token", false);
+    const response = await waitFor(() => output.find(message => message.type === "response" && message.callID === 106));
+    expect(response).toMatchObject({ data: { restored: true }, error: undefined });
+  });
+
+  async function reconnect(start: number, token: string, connect = true): Promise<void> {
+    if (connect) dispatch({ type: "connect" });
+    const auth = await waitFor(() => output.slice(start).find(message => message.type === "auth")) as { epoch: number };
+    dispatch({ type: "auth", epoch: auth.epoch, token });
+    await waitFor(() => output.slice(start).find(message => message.type === "status" && message.state === SocketState.Open));
+    const challenge = await waitFor(() => output.slice(start).find(message => message.type === "event" && message.event === "client.confirm")) as { requestID: bigint };
+    dispatch({ type: "respond", requestID: challenge.requestID, event: "client.confirm", data: { accepted: true } });
+  }
+
   function dispatch(data: unknown): void { scope.onmessage?.({ data } as MessageEvent<unknown>); }
 });
 

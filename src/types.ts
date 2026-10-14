@@ -67,6 +67,10 @@ export type SocketOptions = {
   reconnection?: boolean | ReconnectionOptions;
   timeout?: number;
   protocol?: ProtocolOptions;
+  /** Maximum requests waiting for a connection (default 256). */
+  maxQueuedRequests?: number;
+  /** Maximum queued payload bytes (default 64 MiB). */
+  maxQueuedBytes?: number;
 };
 
 export type WorkerConfig = {
@@ -74,6 +78,8 @@ export type WorkerConfig = {
   timeout: number;
   reconnection: Required<ReconnectionOptions>;
   protocol: Required<ProtocolOptions>;
+  maxQueuedRequests?: number;
+  maxQueuedBytes?: number;
 };
 
 export type MainMessage =

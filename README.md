@@ -43,6 +43,48 @@ request ID. The timeout is enforced inside the Worker. `disconnect()` keeps the
 Worker for a later `connect()`, while `close()` terminates it and rejects pending
 requests.
 
+## Requests during reconnect
+
+The worker queues requests made before the ETP handshake completes or while the
+transport is disconnected. After authentication and `HelloAck`, it starts queued
+requests in insertion order. Request timeouts begin when the first request frame
+is passed to `WebSocket.send`, not while waiting for a connection. Calls retain
+their original Promise or callback; the application does not need to catch
+`socket is not connected` and re-emit them.
+
+Reconnection retries are unlimited by default, using the configured exponential
+backoff and `maxDelay`. Set `reconnection.attempts` to a finite number to stop and
+reject waiting requests with a `connection` error when that limit is exhausted.
+With `autoConnect: false`, requests wait for `connect()`. With reconnection
+disabled, automatic retries are disabled and new offline requests wait for a
+manual `connect()`.
+
+`AbortSignal` cancels a queued request without sending it. `disconnect()` rejects
+waiting requests with `closed`; `close()` rejects them with `terminated`.
+Authentication rejection, an auth-provider failure, or a fatal protocol error
+rejects the queue immediately and prevents new calls until an explicit
+`connect()` starts a new attempt.
+
+The queue is held in memory in this worker/session; it is not a persistent outbox.
+It defaults to 256 requests and a conservative 64 MiB payload budget. Exceeding
+these limits rejects the new request with a `protocol` error. Configure the
+limits when constructing the socket:
+
+```ts
+const socket = io({
+  url: "wss://api.example.com/ws",
+  maxQueuedRequests: 256,
+  maxQueuedBytes: 64 << 20,
+});
+```
+
+On a transport loss the worker returns unsent requests (including rate-limited
+frames) to the queue. An inline request already passed to `WebSocket.send` is
+**not replayed**: the server may have committed it before the reply was lost. Its
+Promise/callback receives a `closed` error. Application-level idempotency keys
+are needed to retry those operations safely. Binary transfers continue using
+negotiated ETP transfer resume; this is separate from replaying an RPC.
+
 Server requests use the same event API and an acknowledgment callback:
 
 ```ts

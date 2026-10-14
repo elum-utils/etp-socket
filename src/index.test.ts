@@ -52,6 +52,54 @@ describe("public socket API", () => {
     fakeWorkers.instances.length = 0;
   });
 
+  it("defaults to unlimited reconnect and forwards configurable queue limits", () => {
+    io({ url: "wss://example.test/ws", autoConnect: false });
+    expect(latestWorker().messages[0]).toMatchObject({ config: { reconnection: { attempts: Infinity }, maxQueuedRequests: 256, maxQueuedBytes: 64 << 20 } });
+    io({ url: "wss://example.test/ws", autoConnect: false, maxQueuedRequests: 4, maxQueuedBytes: 100, reconnection: { attempts: 2 } });
+    expect(latestWorker().messages[0]).toMatchObject({ config: { reconnection: { attempts: 2 }, maxQueuedRequests: 4, maxQueuedBytes: 100 } });
+  });
+
+  it("retains the original Promise across disconnect and reconnect statuses", async () => {
+    const socket = io<Outgoing, Incoming>({ url: "wss://example.test/ws", autoConnect: false });
+    const worker = latestWorker();
+    const result = socket.emit("message.send", { text: "queued" });
+    const emit = worker.messages.at(-1) as { callID: number };
+    let settled = false;
+    void result.then(() => { settled = true; });
+    worker.deliver({ type: "disconnect", reason: "connection" });
+    worker.deliver({ type: "status", state: SocketState.Reconnecting });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    worker.deliver({ type: "status", state: SocketState.Open });
+    worker.deliver({ type: "response", callID: emit.callID, data: { id: "original" } });
+    await expect(result).resolves.toEqual({ id: "original" });
+    expect(worker.messages.filter(message => (message as { type: string }).type === "emit")).toHaveLength(1);
+  });
+
+  it("calls a queued callback once only when the worker settles it after reconnect", () => {
+    const socket = io<Outgoing, Incoming>({ url: "wss://example.test/ws", autoConnect: false });
+    const worker = latestWorker(), callback = vi.fn();
+    socket.emit("message.send", { text: "queued" }, callback);
+    const emit = worker.messages.at(-1) as { callID: number };
+    worker.deliver({ type: "status", state: SocketState.Reconnecting });
+    expect(callback).not.toHaveBeenCalled();
+    worker.deliver({ type: "status", state: SocketState.Open });
+    worker.deliver({ type: "response", callID: emit.callID, data: { id: "once" } });
+    worker.deliver({ type: "response", callID: emit.callID, data: { id: "duplicate" } });
+    expect(callback).toHaveBeenCalledExactlyOnceWith(null, { id: "once" });
+  });
+
+  it("propagates AbortSignal cancellation while a request waits offline", async () => {
+    const socket = io<Outgoing, Incoming>({ url: "wss://example.test/ws", autoConnect: false });
+    const worker = latestWorker(), controller = new AbortController();
+    const result = socket.emit("message.send", { text: "queued" }, { signal: controller.signal });
+    const emit = worker.messages.at(-1) as { callID: number };
+    controller.abort();
+    expect(worker.messages.at(-1)).toEqual({ type: "cancel", callID: emit.callID });
+    worker.deliver({ type: "response", callID: emit.callID, error: { code: "closed", message: "request was canceled" } });
+    await expect(result).rejects.toMatchObject({ code: "closed", message: "request was canceled" });
+  });
+
   it("delegates auth to the main thread and resolves emit promises", async () => {
     const auth = vi.fn(async () => "token");
     const socket = io<Outgoing, Incoming>({ url: "wss://example.test/ws", auth, autoConnect: false });

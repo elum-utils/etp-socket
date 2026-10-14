@@ -9,8 +9,12 @@ import {
   type WorkerMessage,
 } from "./types";
 
+type QueuedRequest = { callID: number; event: string; data: unknown; bytes: number };
+type RequestError = { code: SocketErrorCode; message: string };
+
 type Pending = {
   callID: number;
+  unsent?: QueuedRequest;
   timeout?: ReturnType<typeof setTimeout>;
 };
 
@@ -82,15 +86,20 @@ let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
 let nextRequestID = 1000n;
 let authEpoch = 0;
+let authRequested = false;
 let reconnectAttempt = 0;
 let desiredConnection = false;
 let terminated = false;
 let unauthorized = false;
 let protocolFailure = false;
+let connectionFailure: RequestError | undefined;
 let lastWriteAt = 0;
 let lastReadAt = 0;
 let phase: "closed" | "auth" | "hello" | "open" | "draining" | "closing" = "closed";
 const pending = new Map<bigint, Pending>();
+const requestQueue = new Map<number, QueuedRequest>();
+let requestQueueBytes = 0;
+let flushingRequests = false;
 const outgoingTransfers = new Map<bigint, OutgoingTransfer>();
 const incomingTransfers = new Map<bigint, IncomingTransfer>();
 const completedIncoming = new Map<bigint, { receivedBytes: bigint; nextChunk: number }>();
@@ -140,12 +149,21 @@ scope.onmessage = ({ data }: MessageEvent<MainMessage>) => {
       desiredConnection = true;
       unauthorized = false;
       protocolFailure = false;
+      connectionFailure = undefined;
       reconnectAttempt = 0;
       requestAuth(false);
       return;
     case "disconnect":
       desiredConnection = false;
       clearReconnectTimer();
+      clearHandshakeTimer();
+      authRequested = false;
+      authEpoch += 1;
+      rejectQueued("closed", "socket was disconnected");
+      rejectPending("closed", "socket was disconnected");
+      outgoingTransfers.clear();
+      incomingTransfers.clear();
+      resumePending = false;
       closeSocket("client");
       return;
     case "terminate":
@@ -156,6 +174,7 @@ scope.onmessage = ({ data }: MessageEvent<MainMessage>) => {
       clearHandshakeTimer();
       clearWriteScheduler();
       clearProgressScheduler();
+      rejectQueued("terminated", "socket worker is terminated");
       rejectPending("terminated", "socket worker is terminated");
       if (socket) {
         socket.onclose = null;
@@ -170,15 +189,23 @@ scope.onmessage = ({ data }: MessageEvent<MainMessage>) => {
       if (data.epoch !== authEpoch || !desiredConnection || terminated) {
         return;
       }
+      authRequested = false;
+      clearHandshakeTimer();
       if (data.error) {
+        unauthorized = true;
+        desiredConnection = false;
+        connectionFailure = { code: "auth", message: data.error };
+        post({ type: "status", state: SocketState.Unauthorized });
+        rejectQueued("auth", data.error);
+        rejectPending("auth", data.error);
         emitError("auth", data.error);
-        scheduleReconnect();
         return;
       }
       openSocket(data.token ?? "");
       return;
     case "emit":
-      void sendRequest(data.callID, data.event, data.data);
+      if (transportReady() && requestQueue.size === 0 && !flushingRequests) void sendRequest(data.callID, data.event, data.data);
+      else enqueueRequest(data.callID, data.event, data.data);
       return;
     case "respond":
       void sendInboundResponse(data.requestID, data.event, data.data);
@@ -190,12 +217,14 @@ scope.onmessage = ({ data }: MessageEvent<MainMessage>) => {
 };
 
 function requestAuth(reconnecting: boolean): void {
-  if (!config || socket || reconnectTimer || !desiredConnection) {
+  if (!config || socket || reconnectTimer || authRequested || !desiredConnection) {
     return;
   }
   post({ type: "status", state: reconnecting ? SocketState.Reconnecting : SocketState.Connecting });
   authEpoch += 1;
+  authRequested = true;
   post({ type: "auth", epoch: authEpoch });
+  startHandshakeTimer();
 }
 
 function openSocket(token: string): void {
@@ -205,6 +234,7 @@ function openSocket(token: string): void {
   clearWriteScheduler();
   const current = new WebSocket(config.url);
   socket = current;
+  startHandshakeTimer();
   current.binaryType = "arraybuffer";
   current.onopen = () => {
     if (socket !== current) {
@@ -216,7 +246,9 @@ function openSocket(token: string): void {
     startHandshakeTimer();
   };
   current.onmessage = ({ data }: MessageEvent<ArrayBuffer>) => handleMessage(current, data);
-  current.onerror = () => emitError("connection", "WebSocket transport error");
+  current.onerror = () => {
+    if (socket === current) emitError("connection", "WebSocket transport error");
+  };
   current.onclose = () => handleClose(current);
 }
 
@@ -226,6 +258,9 @@ function handleMessage(current: WebSocket, data: ArrayBuffer): void {
   }
   try {
     const frame = p.decodeFrame(data);
+    // Replies/events may already be on the wire when graceful close starts.
+    // They belong to the old session and must not fail newly queued requests.
+    if (phase === "closing" && frame.type !== p.FrameType.Close && frame.type !== p.FrameType.CloseAck) return;
     enforceIncomingRate(frame, data.byteLength);
     lastReadAt = Date.now();
     enforceFrameCapability(frame.type, frame.transferID);
@@ -241,7 +276,10 @@ function handleMessage(current: WebSocket, data: ArrayBuffer): void {
         unauthorized = true;
         desiredConnection = false;
         post({ type: "status", state: SocketState.Unauthorized });
-        emitError("auth", p.decodeAuthReject(frame) || "authentication rejected");
+        connectionFailure = { code: "auth", message: p.decodeAuthReject(frame) || "authentication rejected" };
+        rejectQueued(connectionFailure.code, connectionFailure.message);
+        rejectPending(connectionFailure.code, connectionFailure.message);
+        emitError(connectionFailure.code, connectionFailure.message);
         current.close();
         return;
       case p.FrameType.HelloAck:
@@ -263,6 +301,7 @@ function handleMessage(current: WebSocket, data: ArrayBuffer): void {
         post({ type: "status", state: SocketState.Open });
         startHeartbeat();
         resumeOutgoingTransfers();
+        void flushRequests();
         return;
       case p.FrameType.Ping:
         requireTransferPhase("ping before handshake completion");
@@ -286,6 +325,12 @@ function handleMessage(current: WebSocket, data: ArrayBuffer): void {
         const remoteError = p.decodeError(frame);
         post({ type: "protocol", event: { code: `remote_error_${remoteError.code}`, message: remoteError.message, frameType: remoteError.frameType, transferID: remoteError.transferID } });
         rejectResponse(remoteError.requestID || frame.requestID, remoteError.code === 2 ? "auth" : "protocol", remoteError.message || "server returned an ETP error");
+        if (remoteError.code === 2) {
+          unauthorized = true;
+          desiredConnection = false;
+          connectionFailure = { code: "auth", message: remoteError.message || "authentication rejected" };
+          post({ type: "status", state: SocketState.Unauthorized });
+        }
         if (remoteError.code === 1 || remoteError.code === 2) throw new p.ProtocolError(`fatal remote ETP error ${remoteError.code}`);
         return;
       case p.FrameType.Ack:
@@ -364,18 +409,79 @@ function handleMessage(current: WebSocket, data: ArrayBuffer): void {
     const message = error instanceof Error ? error.message : "invalid ETP frame";
     protocolFailure = true;
     desiredConnection = false;
-    emitError("protocol", message);
+    connectionFailure ??= { code: "protocol", message };
+    rejectQueued(connectionFailure.code, connectionFailure.message);
+    rejectPending(connectionFailure.code, connectionFailure.message);
+    emitError(connectionFailure.code, connectionFailure.message);
     current.close();
   }
 }
 
-async function sendRequest(callID: number, event: string, data: unknown): Promise<void> {
-  if (!socket || socket.readyState !== WebSocket.OPEN || !isOpen()) {
-    postResponse(callID, undefined, { code: "closed", message: "socket is not connected" });
+function transportReady(): boolean {
+  return Boolean(socket && socket.readyState === WebSocket.OPEN && isOpen());
+}
+
+function payloadBytes(event: string, data: unknown): number {
+  const nameBytes = event.length * 3;
+  if (isMultipartPayload(data)) return nameBytes + JSON.stringify(data.fields).length * 3 + data.parts.reduce((bytes, part) => bytes + binaryPartSize(part.blob) + (part.name.length + part.field.length) * 3, 0);
+  if (data instanceof Blob || data instanceof ArrayBuffer || data instanceof Uint8Array) return nameBytes + binaryPartSize(data);
+  return nameBytes + (JSON.stringify(data) ?? "null").length * 3;
+}
+
+function enqueueRequest(callID: number, event: string, data: unknown, reconnect = true): void {
+  if (terminated || connectionFailure) {
+    postResponse(callID, undefined, connectionFailure ?? { code: "terminated", message: "socket worker is terminated" });
     return;
   }
+  try {
+    const bytes = payloadBytes(event, data);
+    if (requestQueue.size >= (config?.maxQueuedRequests ?? 256) || requestQueueBytes + bytes > (config?.maxQueuedBytes ?? 64 << 20)) {
+      throw new p.ProtocolError("outgoing request queue limit exceeded");
+    }
+    requestQueue.set(callID, { callID, event, data, bytes });
+    requestQueueBytes += bytes;
+    if (transportReady()) void flushRequests();
+    else if (reconnect && socket?.readyState === WebSocket.CLOSED) handleClose(socket);
+    else if (reconnect && desiredConnection && config?.reconnection.enabled) requestAuth(false);
+  } catch (error) {
+    postResponse(callID, undefined, { code: "protocol", message: error instanceof Error ? error.message : "request encoding failed" });
+  }
+}
+
+function removeQueued(callID: number): QueuedRequest | undefined {
+  const request = requestQueue.get(callID);
+  if (request) { requestQueue.delete(callID); requestQueueBytes -= request.bytes; }
+  return request;
+}
+
+async function flushRequests(): Promise<void> {
+  if (flushingRequests) return;
+  flushingRequests = true;
+  try {
+    while (transportReady() && requestQueue.size > 0) {
+      const request = requestQueue.values().next().value!;
+      removeQueued(request.callID);
+      await sendRequest(request.callID, request.event, request.data);
+    }
+  } finally { flushingRequests = false; }
+}
+
+function rejectQueued(code: SocketErrorCode, message: string): void {
+  for (const request of requestQueue.values()) postResponse(request.callID, undefined, { code, message });
+  requestQueue.clear();
+  requestQueueBytes = 0;
+}
+
+function removeUnsentTransfer(requestID: bigint): void {
+  for (const transfer of outgoingTransfers.values()) {
+    if (transfer.requestID === requestID) outgoingTransfers.delete(transfer.transferID);
+  }
+}
+
+async function sendRequest(callID: number, event: string, data: unknown): Promise<void> {
+  if (!transportReady()) { enqueueRequest(callID, event, data); return; }
   const requestID = ++nextRequestID;
-  pending.set(requestID, { callID });
+  pending.set(requestID, { callID, unsent: { callID, event, data, bytes: 0 } });
   try {
     if (isMultipartPayload(data)) {
       const [bytes, parts] = await readMultipart(data);
@@ -405,6 +511,18 @@ async function sendRequest(callID: number, event: string, data: unknown): Promis
       await startTransfer(callID, requestID, event, body);
     }
   } catch (error) {
+    const request = pending.get(requestID);
+    // A close/cancel may have removed this request while a Blob was read.
+    if (!request) return;
+    if (request.unsent && !transportReady() && (
+      (error instanceof p.ProtocolError && error.message === "WebSocket is not open") ||
+      (error instanceof DOMException && error.name === "InvalidStateError")
+    )) {
+      pending.delete(requestID);
+      removeUnsentTransfer(requestID);
+      enqueueRequest(callID, event, data);
+      return;
+    }
     clearPendingTimeout(requestID);
     pending.delete(requestID);
     postResponse(callID, undefined, {
@@ -574,6 +692,10 @@ function cancelTransferForRequest(requestID: bigint, reasonCode: number): void {
 }
 
 function cancelCall(callID: number): void {
+  if (removeQueued(callID)) {
+    postResponse(callID, undefined, { code: "closed", message: "request was canceled" });
+    return;
+  }
   for (const [requestID, request] of pending) {
     if (request.callID !== callID) continue;
     if (request.timeout !== undefined) clearTimeout(request.timeout);
@@ -746,7 +868,10 @@ function emitIncomingProgress(transfer: IncomingTransfer, state: TransferProgres
 function failProtocol(current: WebSocket, error: unknown): void {
   protocolFailure = true;
   desiredConnection = false;
-  emitError("protocol", error instanceof Error ? error.message : "invalid ETP frame");
+  connectionFailure = { code: "protocol", message: error instanceof Error ? error.message : "invalid ETP frame" };
+  rejectQueued(connectionFailure.code, connectionFailure.message);
+  rejectPending(connectionFailure.code, connectionFailure.message);
+  emitError(connectionFailure.code, connectionFailure.message);
   current.close();
 }
 
@@ -778,7 +903,22 @@ function handleClose(current: WebSocket): void {
   clearWriteScheduler();
   clearProgressScheduler();
   socket = undefined;
-  const preserveOutgoing = desiredConnection && Boolean(remoteHello?.capabilities && (remoteHello.capabilities & p.Capability.TransferResume));
+  const reconnecting = desiredConnection && Boolean(config?.reconnection.enabled) && !unauthorized && !protocolFailure && !terminated;
+  if (reconnecting) {
+    // Restore only requests whose first frame was never passed to WebSocket.send.
+    const unsent: QueuedRequest[] = [];
+    for (const [requestID, request] of pending) {
+      if (!request.unsent) continue;
+      pending.delete(requestID);
+      removeUnsentTransfer(requestID);
+      unsent.push(request.unsent);
+    }
+    // Older unsent requests stay ahead of new requests received while offline.
+    const newer = [...requestQueue.values()];
+    requestQueue.clear(); requestQueueBytes = 0;
+    for (const request of [...unsent, ...newer]) enqueueRequest(request.callID, request.event, request.data, false);
+  }
+  const preserveOutgoing = reconnecting && Boolean(remoteHello?.capabilities && (remoteHello.capabilities & p.Capability.TransferResume));
   resumePending = preserveOutgoing && outgoingTransfers.size > 0;
   if (preserveOutgoing) {
     for (const transfer of outgoingTransfers.values()) {
@@ -793,13 +933,24 @@ function handleClose(current: WebSocket): void {
   stopHeartbeat();
   clearHandshakeTimer();
   phase = "closed";
-  if (!preserveOutgoing) rejectPending("closed", "connection closed before a response was received");
+  const failure = connectionFailure ?? { code: "closed" as const, message: "connection closed before a response was received" };
+  const manualDisconnect = !desiredConnection && !terminated && !unauthorized && !protocolFailure;
+  if (!reconnecting && !manualDisconnect) rejectQueued(failure.code, failure.message);
+  // Inline requests already sent have no transport-level deduplication. Only
+  // negotiated binary transfer resume can retain a dispatched request.
+  const resumable = new Set([...outgoingTransfers.values()].map(transfer => transfer.requestID));
+  for (const [requestID, request] of pending) {
+    if (preserveOutgoing && resumable.has(requestID)) continue;
+    clearPendingTimeout(requestID);
+    pending.delete(requestID);
+    postResponse(request.callID, undefined, failure);
+  }
   const reason: DisconnectReason = terminated ? "terminated" : unauthorized ? "auth" : protocolFailure ? "protocol" : desiredConnection ? "connection" : "client";
   post({ type: "disconnect", reason });
   if (terminated) {
     return;
   }
-  post({ type: "status", state: SocketState.Closed });
+  post({ type: "status", state: unauthorized ? SocketState.Unauthorized : SocketState.Closed });
   if (desiredConnection && !unauthorized) {
     scheduleReconnect();
   }
@@ -814,7 +965,11 @@ function closeSocket(reason: DisconnectReason): void {
   if (phase === "open" && remoteHello?.capabilities && (remoteHello.capabilities & p.Capability.GracefulClose)) {
     phase = "closing";
     sendRaw(p.encodeClose({ reasonCode: reason === "client" ? 4 : 0, flags: p.CloseFlag.Immediate, drainTimeoutMillis: 0 }));
-    setTimeout(() => socket?.close(), config?.timeout ?? 10_000);
+    const closingSocket = socket;
+    setTimeout(() => {
+      // A delayed close from an old connection must not close its replacement.
+      if (socket === closingSocket) closingSocket.close();
+    }, config?.timeout ?? 10_000);
     return;
   }
   socket.close();
@@ -848,7 +1003,11 @@ function scheduleReconnect(): void {
   }
   if (reconnectAttempt >= config.reconnection.attempts) {
     desiredConnection = false;
-    emitError("connection", "reconnection attempts exhausted");
+    connectionFailure = { code: "connection", message: "reconnection attempts exhausted" };
+    rejectQueued(connectionFailure.code, connectionFailure.message);
+    rejectPending(connectionFailure.code, connectionFailure.message);
+    outgoingTransfers.clear(); incomingTransfers.clear();
+    emitError(connectionFailure.code, connectionFailure.message);
     return;
   }
   const delay = Math.min(config.reconnection.delay * 2 ** reconnectAttempt, config.reconnection.maxDelay);
@@ -910,8 +1069,14 @@ function monitorOutgoingTransfers(): void {
 function startHandshakeTimer(): void {
   clearHandshakeTimer();
   handshakeTimer = setTimeout(() => {
+    handshakeTimer = undefined;
     emitError("timeout", "ETP authentication or handshake timed out");
-    socket?.close();
+    if (socket) socket.close();
+    else {
+      authRequested = false;
+      authEpoch += 1;
+      scheduleReconnect();
+    }
   }, config?.timeout ?? 10_000);
 }
 
@@ -1121,6 +1286,7 @@ function tokenWait(state: TokenState, cost: number, rate: number): number {
 function armPendingTimeout(requestID: bigint): void {
   const request = pending.get(requestID);
   if (!request || request.timeout !== undefined) return;
+  request.unsent = undefined;
   request.timeout = setTimeout(() => {
     if (pending.delete(requestID)) {
       cancelTransferForRequest(requestID, 2);
@@ -1136,6 +1302,7 @@ function clearPendingTimeout(requestID: bigint): void {
 
 function shouldDropWrite(frame: ArrayBuffer): boolean {
   const view = new DataView(frame), type = view.getUint8(1);
+  if (type === p.FrameType.Request) return !pending.has(view.getBigUint64(20, false));
   if (type !== p.FrameType.TransferBegin && type !== p.FrameType.Data && type !== p.FrameType.TransferEnd) return false;
   return !outgoingTransfers.has(view.getBigUint64(28, false));
 }
